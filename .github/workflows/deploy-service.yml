@@ -1,0 +1,379 @@
+##
+## Reusable workflow: Deploy BFF or Microservice (ECS Fargate)
+##
+## Builds a Docker image, pushes it to ECR, then performs a zero-downtime
+## ECS rolling deployment by registering a new task definition revision and
+## updating the service. Works identically for BFF and microservice apps.
+##
+## Language runtimes supported for optional pre-Docker artifact builds:
+##   docker-only  — multi-stage Dockerfile handles everything (default)
+##   nodejs       — npm/yarn/pnpm install + build, then Docker
+##   python       — no pre-build needed (Docker handles it); pip-based
+##   java-maven   — mvn package -DskipTests, then Docker
+##   java-gradle  — ./gradlew build -x test, then Docker
+##   go           — go build (optional), then Docker
+##
+## For all runtimes, the Dockerfile in your repo is responsible for the final
+## image. If runtime != docker-only, the build_command step runs first so your
+## Dockerfile can COPY the pre-built artifact (e.g. target/*.jar).
+##
+## Usage in a calling repo:
+##
+##   jobs:
+##     deploy:
+##       uses: your-org/infra-modules/.github/workflows/deploy-service.yml@main
+##       with:
+##         environment: prod
+##         ecr_repository: myapp-prod-use1-ecr-api
+##         cluster_name: myapp-prod-use1-ecs-main
+##         service_name: myapp-prod-use1-ecs-svc-api
+##         container_name: api
+##         task_definition_family: myapp-prod-use1-task-api
+##         runtime: java-maven
+##       secrets:
+##         aws_role_arn: ${{ secrets.AWS_ROLE_ARN_PROD }}
+##
+
+name: Deploy Service (BFF / Microservice)
+
+on:
+  workflow_call:
+    inputs:
+      # ── Targeting ────────────────────────────────────────────────────────────
+      environment:
+        description: "Target environment (dev | qa | prod)"
+        type: string
+        required: true
+      aws_region:
+        description: "AWS region"
+        type: string
+        default: "us-east-1"
+      working_directory:
+        description: "Directory containing the service source code and Dockerfile"
+        type: string
+        default: "."
+
+      # ── Runtime / Build ──────────────────────────────────────────────────────
+      runtime:
+        description: "Build runtime: docker-only | nodejs | python | java-maven | java-gradle | go"
+        type: string
+        default: "docker-only"
+      node_version:
+        description: "Node.js version (nodejs runtime)"
+        type: string
+        default: "20"
+      node_package_manager:
+        description: "Package manager for Node.js: npm | yarn | pnpm"
+        type: string
+        default: "npm"
+      java_version:
+        description: "Java version (java-maven or java-gradle runtime)"
+        type: string
+        default: "21"
+      java_distribution:
+        description: "JDK distribution: temurin | corretto | zulu"
+        type: string
+        default: "corretto"
+      python_version:
+        description: "Python version (python runtime)"
+        type: string
+        default: "3.12"
+      go_version:
+        description: "Go version (go runtime)"
+        type: string
+        default: "1.22"
+      build_command:
+        description: "Override the default pre-Docker build command for the selected runtime"
+        type: string
+        default: ""
+
+      # ── Docker ───────────────────────────────────────────────────────────────
+      dockerfile_path:
+        description: "Path to Dockerfile (relative to working_directory)"
+        type: string
+        default: "Dockerfile"
+      docker_build_args:
+        description: "Newline-separated Docker build args (e.g. APP_ENV=prod)"
+        type: string
+        default: ""
+      docker_build_target:
+        description: "Docker build target stage (multi-stage builds)"
+        type: string
+        default: ""
+      image_tag_extra:
+        description: "Additional tag to apply to the image (e.g. a semver). SHA is always applied."
+        type: string
+        default: ""
+
+      # ── ECR ──────────────────────────────────────────────────────────────────
+      ecr_repository:
+        description: "ECR repository name (not the full URI)"
+        type: string
+        required: true
+
+      # ── ECS ──────────────────────────────────────────────────────────────────
+      cluster_name:
+        description: "ECS cluster name"
+        type: string
+        required: true
+      service_name:
+        description: "ECS service name"
+        type: string
+        required: true
+      container_name:
+        description: "Container name inside the task definition to update the image on"
+        type: string
+        required: true
+      task_definition_family:
+        description: "Task definition family name (used to fetch the current revision)"
+        type: string
+        required: true
+      deployment_wait_minutes:
+        description: "Minutes to wait for the ECS service to stabilize (0 = don't wait)"
+        type: number
+        default: 10
+
+    secrets:
+      aws_role_arn:
+        description: "IAM role ARN to assume via OIDC (DevOpsRole from platform stack)"
+        required: true
+
+    outputs:
+      image_uri:
+        description: "Full ECR image URI that was deployed (repo:sha)"
+        value: ${{ jobs.build-and-deploy.outputs.image_uri }}
+      task_definition_arn:
+        description: "ARN of the newly registered task definition revision"
+        value: ${{ jobs.build-and-deploy.outputs.task_definition_arn }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy · ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    outputs:
+      image_uri: ${{ steps.push.outputs.image_uri }}
+      task_definition_arn: ${{ steps.register-taskdef.outputs.task_definition_arn }}
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Language toolchain setup (skip for docker-only) ───────────────────
+
+      - name: Set up Node.js ${{ inputs.node_version }}
+        if: inputs.runtime == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: ${{ inputs.node_package_manager }}
+          cache-dependency-path: ${{ inputs.working_directory }}/package-lock.json
+
+      - name: Set up Java ${{ inputs.java_version }} (${{ inputs.java_distribution }})
+        if: startsWith(inputs.runtime, 'java')
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: ${{ inputs.java_distribution }}
+          cache: ${{ inputs.runtime == 'java-maven' && 'maven' || 'gradle' }}
+
+      - name: Set up Python ${{ inputs.python_version }}
+        if: inputs.runtime == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Set up Go ${{ inputs.go_version }}
+        if: inputs.runtime == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: true
+
+      # ── Pre-Docker artifact build ──────────────────────────────────────────
+
+      - name: Build artifact (pre-Docker)
+        if: inputs.runtime != 'docker-only'
+        run: |
+          if [ -n "${{ inputs.build_command }}" ]; then
+            # User-provided override
+            ${{ inputs.build_command }}
+          else
+            case "${{ inputs.runtime }}" in
+              nodejs)
+                case "${{ inputs.node_package_manager }}" in
+                  yarn)  yarn install --frozen-lockfile && yarn build ;;
+                  pnpm)  pnpm install --frozen-lockfile && pnpm run build ;;
+                  *)     npm ci && npm run build ;;
+                esac
+                ;;
+              java-maven)
+                mvn --batch-mode package -DskipTests
+                ;;
+              java-gradle)
+                chmod +x ./gradlew
+                ./gradlew build -x test
+                ;;
+              python)
+                # Python apps typically don't need a pre-build step;
+                # the Dockerfile handles pip install. Override via build_command
+                # if your project requires a compilation step (e.g. protobuf gen).
+                echo "No default pre-build for Python — Dockerfile handles dependencies."
+                ;;
+              go)
+                # Optional: pre-compile to catch errors early. Dockerfile will also build.
+                go build ./...
+                ;;
+            esac
+          fi
+
+      # ── AWS + ECR login ────────────────────────────────────────────────────
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: deploy-svc-${{ inputs.environment }}-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── Docker build + push ────────────────────────────────────────────────
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          REGISTRY="${{ steps.ecr-login.outputs.registry }}"
+          REPO="${{ inputs.ecr_repository }}"
+          SHA="${{ github.sha }}"
+          SHORT_SHA="${SHA:0:7}"
+          IMAGE_URI_SHA="${REGISTRY}/${REPO}:${SHORT_SHA}"
+          IMAGE_URI_LATEST="${REGISTRY}/${REPO}:latest"
+          echo "registry=$REGISTRY" >> $GITHUB_OUTPUT
+          echo "image_uri_sha=$IMAGE_URI_SHA" >> $GITHUB_OUTPUT
+          echo "image_uri_latest=$IMAGE_URI_LATEST" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          TARGET_ARG=""
+          if [ -n "${{ inputs.docker_build_target }}" ]; then
+            TARGET_ARG="--target ${{ inputs.docker_build_target }}"
+          fi
+
+          # Collect build-args from multiline input
+          BUILD_ARGS=""
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            BUILD_ARGS="$BUILD_ARGS --build-arg $line"
+          done <<< "${{ inputs.docker_build_args }}"
+
+          docker build \
+            --file "${{ inputs.dockerfile_path }}" \
+            --tag "${{ steps.meta.outputs.image_uri_sha }}" \
+            --tag "${{ steps.meta.outputs.image_uri_latest }}" \
+            --label "git.sha=${{ github.sha }}" \
+            --label "git.ref=${{ github.ref }}" \
+            --label "build.run=${{ github.run_id }}" \
+            $TARGET_ARG \
+            $BUILD_ARGS \
+            .
+
+      - name: Push image to ECR
+        id: push
+        run: |
+          docker push "${{ steps.meta.outputs.image_uri_sha }}"
+          docker push "${{ steps.meta.outputs.image_uri_latest }}"
+
+          # Push extra tag if requested
+          if [ -n "${{ inputs.image_tag_extra }}" ]; then
+            EXTRA_URI="${{ steps.meta.outputs.registry }}/${{ inputs.ecr_repository }}:${{ inputs.image_tag_extra }}"
+            docker tag "${{ steps.meta.outputs.image_uri_sha }}" "$EXTRA_URI"
+            docker push "$EXTRA_URI"
+          fi
+
+          echo "image_uri=${{ steps.meta.outputs.image_uri_sha }}" >> $GITHUB_OUTPUT
+
+      # ── ECS rolling deployment ─────────────────────────────────────────────
+
+      - name: Fetch current task definition
+        id: fetch-taskdef
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ inputs.task_definition_family }}" \
+            --query 'taskDefinition' \
+            --output json > /tmp/task-definition.json
+          echo "Fetched task definition: $(cat /tmp/task-definition.json | jq -r '.taskDefinitionArn')"
+
+      - name: Update image in task definition
+        id: update-taskdef
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: /tmp/task-definition.json
+          container-name: ${{ inputs.container_name }}
+          image: ${{ steps.push.outputs.image_uri }}
+
+      - name: Register new task definition revision
+        id: register-taskdef
+        run: |
+          # Strip read-only fields before registering
+          NEW_TASKDEF=$(cat "${{ steps.update-taskdef.outputs.task-definition }}" | \
+            jq 'del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.placementConstraints,.compatibilities,.registeredAt,.registeredBy)')
+
+          ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASKDEF" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "task_definition_arn=$ARN" >> $GITHUB_OUTPUT
+          echo "Registered: $ARN"
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster "${{ inputs.cluster_name }}" \
+            --service "${{ inputs.service_name }}" \
+            --task-definition "${{ steps.register-taskdef.outputs.task_definition_arn }}" \
+            --force-new-deployment \
+            --no-cli-pager
+
+      - name: Wait for service stability
+        if: inputs.deployment_wait_minutes > 0
+        run: |
+          echo "Waiting up to ${{ inputs.deployment_wait_minutes }} minutes for service to stabilize..."
+          TIMEOUT=$(( ${{ inputs.deployment_wait_minutes }} * 60 ))
+          aws ecs wait services-stable \
+            --cluster "${{ inputs.cluster_name }}" \
+            --services "${{ inputs.service_name }}" \
+            --cli-read-timeout $TIMEOUT \
+            --cli-connect-timeout 60
+          echo "Service is stable."
+
+      - name: Deployment summary
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ job.status }}' === 'success' ? '✅' : '❌';
+            await core.summary
+              .addHeading(`${status} Service Deployed · \`${{ inputs.environment }}\``)
+              .addTable([
+                [{data: 'Field', header: true}, {data: 'Value', header: true}],
+                ['Service', '`${{ inputs.service_name }}`'],
+                ['Cluster', '`${{ inputs.cluster_name }}`'],
+                ['Image', `\`${{ steps.meta.outputs.short_sha }}\``],
+                ['Task Def', `\`${{ steps.register-taskdef.outputs.task_definition_arn }}\``],
+                ['Runtime', '`${{ inputs.runtime }}`'],
+                ['Actor', `@${{ github.actor }}`],
+              ])
+              .write();

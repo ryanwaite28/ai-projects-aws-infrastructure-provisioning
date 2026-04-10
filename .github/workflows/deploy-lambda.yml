@@ -1,0 +1,383 @@
+##
+## Reusable workflow: Deploy Lambda Function
+##
+## Packages a Lambda deployment artifact for the given runtime, uploads it to
+## S3, and updates the Lambda function code. Covers: webhook ingestion
+## processors, serverless API handlers, scheduled jobs, and async workers.
+##
+## Language runtimes supported:
+##   python    — pip install -r requirements.txt into package dir, then zip
+##   nodejs    — npm ci (production), then zip
+##   java-maven  — mvn package -DskipTests, uploads the shaded JAR/ZIP
+##   java-gradle — ./gradlew build -x test, uploads the shadow JAR
+##   go          — GOOS=linux GOARCH=amd64 go build → zip the binary
+##   zip-only    — Upload a pre-built artifact at artifact_path (no build step)
+##
+## Usage in a calling repo:
+##
+##   jobs:
+##     deploy:
+##       uses: your-org/infra-modules/.github/workflows/deploy-lambda.yml@main
+##       with:
+##         environment: prod
+##         function_name: myapp-prod-use1-fn-webhook-processor
+##         runtime: python
+##         s3_bucket: myapp-prod-use1-s3-lambda-artifacts
+##       secrets:
+##         aws_role_arn: ${{ secrets.AWS_ROLE_ARN_PROD }}
+##
+
+name: Deploy Lambda Function
+
+on:
+  workflow_call:
+    inputs:
+      # ── Targeting ────────────────────────────────────────────────────────────
+      environment:
+        description: "Target environment (dev | qa | prod)"
+        type: string
+        required: true
+      aws_region:
+        description: "AWS region"
+        type: string
+        default: "us-east-1"
+      working_directory:
+        description: "Directory containing the Lambda source code"
+        type: string
+        default: "."
+
+      # ── Lambda identity ───────────────────────────────────────────────────────
+      function_name:
+        description: "Lambda function name (or ARN)"
+        type: string
+        required: true
+
+      # ── Runtime / Build ───────────────────────────────────────────────────────
+      runtime:
+        description: "Build runtime: python | nodejs | java-maven | java-gradle | go | zip-only"
+        type: string
+        default: "python"
+      python_version:
+        description: "Python version"
+        type: string
+        default: "3.12"
+      node_version:
+        description: "Node.js version"
+        type: string
+        default: "20"
+      java_version:
+        description: "Java version"
+        type: string
+        default: "21"
+      java_distribution:
+        description: "JDK distribution: corretto | temurin | zulu"
+        type: string
+        default: "corretto"
+      go_version:
+        description: "Go version"
+        type: string
+        default: "1.22"
+      go_binary_name:
+        description: "Output binary name for Go builds (default: bootstrap, required for provided.al2)"
+        type: string
+        default: "bootstrap"
+      build_command:
+        description: "Override the default build command for the selected runtime"
+        type: string
+        default: ""
+
+      # ── Artifact ──────────────────────────────────────────────────────────────
+      artifact_path:
+        description: |
+          For zip-only: path to the pre-built zip/jar relative to working_directory.
+          For all others: auto-generated — leave blank.
+        type: string
+        default: ""
+
+      # ── S3 deployment bucket ──────────────────────────────────────────────────
+      s3_bucket:
+        description: "S3 bucket to upload the deployment package to"
+        type: string
+        required: true
+      s3_prefix:
+        description: "S3 key prefix (e.g. lambda/webhook-processor/)"
+        type: string
+        default: "lambda/"
+
+      # ── Lambda update options ─────────────────────────────────────────────────
+      publish_version:
+        description: "Publish a new Lambda version after deploying (true/false)"
+        type: string
+        default: "false"
+      update_alias:
+        description: "Alias to point at the new version (requires publish_version=true)"
+        type: string
+        default: ""
+      wait_for_update:
+        description: "Wait for the Lambda update to complete before finishing"
+        type: string
+        default: "true"
+
+    secrets:
+      aws_role_arn:
+        description: "IAM role ARN to assume via OIDC (DevOpsRole from platform stack)"
+        required: true
+
+    outputs:
+      s3_key:
+        description: "S3 key of the uploaded artifact"
+        value: ${{ jobs.deploy.outputs.s3_key }}
+      function_arn:
+        description: "Lambda function ARN after update"
+        value: ${{ jobs.deploy.outputs.function_arn }}
+      version:
+        description: "Published Lambda version (if publish_version=true)"
+        value: ${{ jobs.deploy.outputs.version }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Lambda · ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    outputs:
+      s3_key:       ${{ steps.upload.outputs.s3_key }}
+      function_arn: ${{ steps.update-code.outputs.function_arn }}
+      version:      ${{ steps.publish.outputs.version }}
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Language toolchain setup ───────────────────────────────────────────
+
+      - name: Set up Python ${{ inputs.python_version }}
+        if: inputs.runtime == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Set up Node.js ${{ inputs.node_version }}
+        if: inputs.runtime == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Set up Java ${{ inputs.java_version }} (${{ inputs.java_distribution }})
+        if: startsWith(inputs.runtime, 'java')
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: ${{ inputs.java_distribution }}
+          cache: ${{ inputs.runtime == 'java-maven' && 'maven' || 'gradle' }}
+
+      - name: Set up Go ${{ inputs.go_version }}
+        if: inputs.runtime == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: true
+
+      # ── Build deployment package ───────────────────────────────────────────
+
+      - name: Build (Python)
+        if: inputs.runtime == 'python'
+        run: |
+          if [ -n "${{ inputs.build_command }}" ]; then
+            ${{ inputs.build_command }}
+          else
+            # Install dependencies into a 'package' directory, then zip with source.
+            pip install \
+              --platform manylinux2014_x86_64 \
+              --target=./package \
+              --implementation cp \
+              --python-version ${{ inputs.python_version }} \
+              --only-binary=:all: \
+              --upgrade \
+              -r requirements.txt 2>/dev/null || \
+            pip install -r requirements.txt -t ./package
+            cd package && zip -r ../deployment.zip . && cd ..
+            # Add source files (exclude tests, __pycache__, .git)
+            zip -r deployment.zip . \
+              --exclude "package/*" \
+              --exclude "*.pyc" \
+              --exclude "__pycache__/*" \
+              --exclude "tests/*" \
+              --exclude ".git/*" \
+              --exclude "*.tfvars"
+          fi
+          echo "artifact=deployment.zip" >> $GITHUB_ENV
+
+      - name: Build (Node.js)
+        if: inputs.runtime == 'nodejs'
+        run: |
+          if [ -n "${{ inputs.build_command }}" ]; then
+            ${{ inputs.build_command }}
+          else
+            npm ci --omit=dev
+            # If there's a build step (TypeScript etc.)
+            if grep -q '"build"' package.json 2>/dev/null; then
+              npm run build
+            fi
+            zip -r deployment.zip . \
+              --exclude ".git/*" \
+              --exclude "*.test.*" \
+              --exclude "**/__tests__/*" \
+              --exclude "*.md"
+          fi
+          echo "artifact=deployment.zip" >> $GITHUB_ENV
+
+      - name: Build (Java / Maven)
+        if: inputs.runtime == 'java-maven'
+        run: |
+          if [ -n "${{ inputs.build_command }}" ]; then
+            ${{ inputs.build_command }}
+          else
+            mvn --batch-mode package -DskipTests
+          fi
+          # Find the deployable JAR (prefer shaded/uber JAR)
+          JAR=$(find target -name "*-shaded.jar" -o -name "*-all.jar" -o -name "*-aws.jar" 2>/dev/null | head -1)
+          if [ -z "$JAR" ]; then
+            JAR=$(find target -name "*.jar" ! -name "*-sources.jar" ! -name "*-javadoc.jar" | head -1)
+          fi
+          echo "artifact=$JAR" >> $GITHUB_ENV
+
+      - name: Build (Java / Gradle)
+        if: inputs.runtime == 'java-gradle'
+        run: |
+          if [ -n "${{ inputs.build_command }}" ]; then
+            ${{ inputs.build_command }}
+          else
+            chmod +x ./gradlew
+            ./gradlew build shadowJar -x test 2>/dev/null || ./gradlew build -x test
+          fi
+          JAR=$(find build/libs -name "*-all.jar" -o -name "*-fat.jar" 2>/dev/null | head -1)
+          if [ -z "$JAR" ]; then
+            JAR=$(find build/libs -name "*.jar" ! -name "*-plain.jar" | head -1)
+          fi
+          echo "artifact=$JAR" >> $GITHUB_ENV
+
+      - name: Build (Go)
+        if: inputs.runtime == 'go'
+        run: |
+          if [ -n "${{ inputs.build_command }}" ]; then
+            ${{ inputs.build_command }}
+          else
+            GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
+              -ldflags="-s -w" \
+              -o "${{ inputs.go_binary_name }}" \
+              ./...
+            zip deployment.zip "${{ inputs.go_binary_name }}"
+          fi
+          echo "artifact=deployment.zip" >> $GITHUB_ENV
+
+      - name: Use pre-built artifact (zip-only)
+        if: inputs.runtime == 'zip-only'
+        run: |
+          if [ -z "${{ inputs.artifact_path }}" ]; then
+            echo "ERROR: artifact_path must be set when runtime=zip-only"
+            exit 1
+          fi
+          echo "artifact=${{ inputs.artifact_path }}" >> $GITHUB_ENV
+
+      # ── AWS credentials + upload ───────────────────────────────────────────
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: deploy-lambda-${{ inputs.environment }}-${{ github.run_id }}
+
+      - name: Upload artifact to S3
+        id: upload
+        run: |
+          SHORT_SHA="${{ github.sha }}"
+          SHORT_SHA="${SHORT_SHA:0:7}"
+          FILENAME=$(basename "${{ env.artifact }}")
+          EXTENSION="${FILENAME##*.}"
+          VERSIONED_KEY="${{ inputs.s3_prefix }}${{ inputs.function_name }}/${SHORT_SHA}.${EXTENSION}"
+
+          aws s3 cp "${{ env.artifact }}" "s3://${{ inputs.s3_bucket }}/${VERSIONED_KEY}"
+          echo "s3_key=$VERSIONED_KEY" >> $GITHUB_OUTPUT
+          echo "Uploaded to s3://${{ inputs.s3_bucket }}/${VERSIONED_KEY}"
+
+      - name: Update Lambda function code
+        id: update-code
+        run: |
+          ARN=$(aws lambda update-function-code \
+            --function-name "${{ inputs.function_name }}" \
+            --s3-bucket "${{ inputs.s3_bucket }}" \
+            --s3-key "${{ steps.upload.outputs.s3_key }}" \
+            --query 'FunctionArn' \
+            --output text)
+          echo "function_arn=$ARN" >> $GITHUB_OUTPUT
+          echo "Updated function: $ARN"
+
+      - name: Wait for update to complete
+        if: inputs.wait_for_update == 'true'
+        run: |
+          echo "Waiting for Lambda update to complete..."
+          aws lambda wait function-updated \
+            --function-name "${{ inputs.function_name }}"
+          echo "Lambda update complete."
+
+      - name: Publish Lambda version
+        id: publish
+        if: inputs.publish_version == 'true'
+        run: |
+          VERSION=$(aws lambda publish-version \
+            --function-name "${{ inputs.function_name }}" \
+            --description "Deploy ${{ github.sha }} by ${{ github.actor }}" \
+            --query 'Version' \
+            --output text)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Published version: $VERSION"
+
+      - name: Update alias to new version
+        if: inputs.publish_version == 'true' && inputs.update_alias != ''
+        run: |
+          # Create alias if it doesn't exist, otherwise update it.
+          aws lambda update-alias \
+            --function-name "${{ inputs.function_name }}" \
+            --name "${{ inputs.update_alias }}" \
+            --function-version "${{ steps.publish.outputs.version }}" \
+            2>/dev/null || \
+          aws lambda create-alias \
+            --function-name "${{ inputs.function_name }}" \
+            --name "${{ inputs.update_alias }}" \
+            --function-version "${{ steps.publish.outputs.version }}"
+          echo "Alias '${{ inputs.update_alias }}' → version ${{ steps.publish.outputs.version }}"
+
+      - name: Deployment summary
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ job.status }}' === 'success' ? '✅' : '❌';
+            const rows = [
+              [{data: 'Field', header: true}, {data: 'Value', header: true}],
+              ['Function', '`${{ inputs.function_name }}`'],
+              ['Runtime', '`${{ inputs.runtime }}`'],
+              ['S3 Key', '`${{ steps.upload.outputs.s3_key }}`'],
+              ['Function ARN', '`${{ steps.update-code.outputs.function_arn }}`'],
+              ['Actor', `@${{ github.actor }}`],
+            ];
+            if ('${{ inputs.publish_version }}' === 'true') {
+              rows.push(['Version', '`${{ steps.publish.outputs.version }}`']);
+            }
+            if ('${{ inputs.update_alias }}') {
+              rows.push(['Alias', '`${{ inputs.update_alias }}`']);
+            }
+            await core.summary
+              .addHeading(`${status} Lambda Deployed · \`${{ inputs.environment }}\``)
+              .addTable(rows)
+              .write();

@@ -1,0 +1,215 @@
+##
+## Reusable workflow: Deploy Frontend Application
+##
+## Builds a static frontend (React, Vue, Angular, Next.js export, etc.),
+## syncs the output to S3, and invalidates the CloudFront distribution.
+##
+## Assumes:
+##   - The S3 bucket and CloudFront distribution already exist (provisioned by
+##     stacks/frontend or stacks/platform via terraform).
+##   - The OIDC role has s3:PutObject, s3:DeleteObject, s3:ListBucket,
+##     cloudfront:CreateInvalidation permissions.
+##
+## Usage in a calling repo:
+##
+##   jobs:
+##     deploy:
+##       uses: your-org/infra-modules/.github/workflows/deploy-frontend.yml@main
+##       with:
+##         environment: prod
+##         s3_bucket: myapp-prod-frontend
+##         cloudfront_distribution_id: EABCDEF1234567
+##         build_command: npm run build
+##         build_output_dir: dist
+##       secrets:
+##         aws_role_arn: ${{ secrets.AWS_ROLE_ARN_PROD }}
+##
+
+name: Deploy Frontend
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Target environment (dev | qa | prod)"
+        type: string
+        required: true
+      aws_region:
+        description: "AWS region"
+        type: string
+        default: "us-east-1"
+      working_directory:
+        description: "Directory containing the frontend source code"
+        type: string
+        default: "."
+      node_version:
+        description: "Node.js version to use for the build"
+        type: string
+        default: "20"
+      package_manager:
+        description: "Package manager: npm | yarn | pnpm"
+        type: string
+        default: "npm"
+      build_command:
+        description: "Command to build the static assets"
+        type: string
+        default: "npm run build"
+      build_output_dir:
+        description: "Directory containing built static assets (relative to working_directory)"
+        type: string
+        default: "dist"
+      s3_bucket:
+        description: "S3 bucket name to sync assets into"
+        type: string
+        required: true
+      s3_prefix:
+        description: "Optional key prefix within the bucket (e.g. 'app/')"
+        type: string
+        default: ""
+      cloudfront_distribution_id:
+        description: "CloudFront distribution ID to invalidate after deploy"
+        type: string
+        required: true
+      cloudfront_invalidation_paths:
+        description: "Space-separated paths to invalidate (default: /*)"
+        type: string
+        default: "/*"
+      cache_control_immutable:
+        description: "Glob pattern for immutable assets (gets long max-age + immutable header)"
+        type: string
+        default: "*.{js,css,woff2,woff,ttf,png,jpg,webp,svg,ico}"
+      delete_removed:
+        description: "Delete S3 objects not present in the build output (true/false)"
+        type: string
+        default: "true"
+    secrets:
+      aws_role_arn:
+        description: "IAM role ARN to assume via OIDC (DevOpsRole from platform stack)"
+        required: true
+    outputs:
+      cloudfront_invalidation_id:
+        description: "CloudFront invalidation ID"
+        value: ${{ jobs.deploy.outputs.invalidation_id }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Frontend · ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    outputs:
+      invalidation_id: ${{ steps.invalidate.outputs.invalidation_id }}
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ inputs.node_version }}
+        uses: actions/setup-node@v4
+        with:
+          node_version: ${{ inputs.node_version }}
+          cache: ${{ inputs.package_manager }}
+          cache-dependency-path: ${{ inputs.working_directory }}/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          case "${{ inputs.package_manager }}" in
+            yarn)  yarn install --frozen-lockfile ;;
+            pnpm)  pnpm install --frozen-lockfile ;;
+            *)     npm ci ;;
+          esac
+
+      - name: Build
+        run: ${{ inputs.build_command }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: deploy-frontend-${{ inputs.environment }}-${{ github.run_id }}
+
+      - name: Sync immutable assets (long-lived cache)
+        # Hashed filenames (e.g. main.abc123.js) can be cached forever.
+        run: |
+          aws s3 sync "${{ inputs.build_output_dir }}/" \
+            "s3://${{ inputs.s3_bucket }}/${{ inputs.s3_prefix }}" \
+            --exclude "*" \
+            --include "*.js" \
+            --include "*.css" \
+            --include "*.woff2" \
+            --include "*.woff" \
+            --include "*.ttf" \
+            --include "*.png" \
+            --include "*.jpg" \
+            --include "*.webp" \
+            --include "*.svg" \
+            --include "*.ico" \
+            --cache-control "public, max-age=31536000, immutable" \
+            --metadata-directive REPLACE
+
+      - name: Sync HTML and entry-point assets (no-cache)
+        # HTML files and non-hashed assets must revalidate on every request.
+        run: |
+          DELETE_FLAG=""
+          if [ "${{ inputs.delete_removed }}" = "true" ]; then
+            DELETE_FLAG="--delete"
+          fi
+          aws s3 sync "${{ inputs.build_output_dir }}/" \
+            "s3://${{ inputs.s3_bucket }}/${{ inputs.s3_prefix }}" \
+            --exclude "*.js" \
+            --exclude "*.css" \
+            --exclude "*.woff2" \
+            --exclude "*.woff" \
+            --exclude "*.ttf" \
+            --exclude "*.png" \
+            --exclude "*.jpg" \
+            --exclude "*.webp" \
+            --exclude "*.svg" \
+            --exclude "*.ico" \
+            --cache-control "public, max-age=0, must-revalidate" \
+            --metadata-directive REPLACE \
+            $DELETE_FLAG
+
+      - name: Invalidate CloudFront cache
+        id: invalidate
+        run: |
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id "${{ inputs.cloudfront_distribution_id }}" \
+            --paths ${{ inputs.cloudfront_invalidation_paths }} \
+            --query 'Invalidation.Id' \
+            --output text)
+          echo "invalidation_id=$INVALIDATION_ID" >> $GITHUB_OUTPUT
+          echo "CloudFront invalidation created: $INVALIDATION_ID"
+
+      - name: Wait for invalidation to complete
+        run: |
+          echo "Waiting for CloudFront invalidation ${{ steps.invalidate.outputs.invalidation_id }} ..."
+          aws cloudfront wait invalidation-completed \
+            --distribution-id "${{ inputs.cloudfront_distribution_id }}" \
+            --id "${{ steps.invalidate.outputs.invalidation_id }}"
+          echo "Invalidation complete."
+
+      - name: Deployment summary
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await core.summary
+              .addHeading('🌐 Frontend Deployed · `${{ inputs.environment }}`')
+              .addTable([
+                [{data: 'Field', header: true}, {data: 'Value', header: true}],
+                ['S3 Bucket', '`${{ inputs.s3_bucket }}`'],
+                ['CloudFront', '`${{ inputs.cloudfront_distribution_id }}`'],
+                ['Invalidation', '`${{ steps.invalidate.outputs.invalidation_id }}`'],
+                ['Commit', `[\`${context.sha.substring(0, 7)}\`](${context.payload.repository.html_url}/commit/${context.sha})`],
+                ['Actor', `@${{ github.actor }}`],
+              ])
+              .write();

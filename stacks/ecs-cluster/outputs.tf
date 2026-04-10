@@ -1,0 +1,15 @@
+output "ecs_cluster_arn"             { value = module.ecs_cluster.cluster_arn }
+output "ecs_cluster_name"            { value = module.ecs_cluster.cluster_name }
+output "public_alb_arn"              { value = module.public_alb.alb_arn }
+output "public_alb_dns"              { value = module.public_alb.alb_dns_name }
+output "public_alb_zone_id"          { value = module.public_alb.alb_zone_id }
+output "public_alb_listener_arn"     { value = module.public_alb.https_listener_arn }
+output "private_alb_arn"             { value = module.private_alb.alb_arn }
+output "private_alb_dns"             { value = module.private_alb.alb_dns_name }
+output "private_alb_zone_id"         { value = module.private_alb.alb_zone_id }
+output "private_alb_listener_arn"    { value = module.private_alb.https_listener_arn }
+output "sg_public_alb_id"            { value = aws_security_group.public_alb.id }
+output "sg_private_alb_id"           { value = aws_security_group.private_alb.id }
+output "sg_ecs_tasks_id"             { value = aws_security_group.ecs_tasks.id }
+output "waf_web_acl_arn"             { value = module.waf.web_acl_arn }
+output "acm_certificate_arn"         { value = module.acm.certificate_arn }

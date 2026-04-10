@@ -674,10 +674,18 @@ Rules are implemented as separate `aws_security_group_rule` resources (not inlin
 ---
 
 #### Platform IAM
-- **`DevOpsRole`** — assumable by GitHub Actions OIDC and ops engineers; permissions cover ECS, ECR, ALB, Route53, ACM, Secrets Manager, SSM, CloudWatch, IAM role passing for ECS tasks
+
+Two distinct GitHub Actions OIDC roles exist in this system — they serve different pipelines:
+
+| Role | Created by | Used by | Permissions |
+|------|-----------|---------|-------------|
+| `{project}-github-actions-{env}` | `bootstrap/oidc` | `tf-plan.yml`, `tf-apply.yml` (Terraform CI) | S3/DynamoDB state + broad AWS provisioning |
+| `DevOpsRole` (platform stack) | `stacks/platform` | Application repos' deploy workflows | ECR push, ECS deploy, SSM/Secrets read — scoped only |
+
+- **`DevOpsRole`** — created by the platform stack and written to SSM. Assumed by application CI/CD pipelines (not Terraform pipelines) to deploy code: push Docker images, update ECS task definitions/services, read Secrets Manager and SSM parameters. Permissions are scoped inline (no managed admin policies). Requires `github_oidc_provider_arn` and `github_repo_subject` variables to be set; omitting either produces a role with no valid trust policy.
 - **`ECSTaskExecutionRole`** — shared baseline execution role; policies: `AmazonECSTaskExecutionRolePolicy`, ECR pull, CloudWatch Logs write, Secrets Manager `GetSecretValue`, SSM `GetParameter`
 - **`ECSTaskBaseRole`** — minimal baseline task role; policies: none by default; application-level `bff` and `microservice` stacks extend this via additional policy attachments
-- IAM permission boundary policy (`PlatformBoundary`) — attached to all task roles; caps maximum effective permissions (no IAM self-modification, no org-level actions, no billing)
+- IAM permission boundary policy (`PlatformBoundary`) — attached to all platform-managed roles; caps maximum effective permissions (no IAM self-modification, no org-level actions, no billing)
 
 ---
 
@@ -1054,23 +1062,37 @@ This creates:
 - A DynamoDB table for state locking (`terraform-state-lock`)
 - A KMS key for state encryption
 
-### Step 7 — Configure GitHub Actions OIDC
+### Step 7 — Configure GitHub Actions OIDC (Terraform execution roles)
 Run the `bootstrap/oidc` module in each environment account:
 ```bash
 cd bootstrap/oidc
-terraform apply -var="github_org=your-org" -var="github_repo=your-repo"
+terraform apply \
+  -var="github_org=your-org" \
+  -var="github_repo=your-infra-repo" \
+  -var="state_bucket_name=myapp-terraform-state" \
+  -var="lock_table_name=myapp-terraform-locks"
 ```
 This creates:
 - An IAM OIDC Identity Provider for `token.actions.githubusercontent.com`
-- An IAM role (`github-actions-role`) with a trust policy scoped to your repository
-- Permissions policies for the CI role (scoped to what Terraform needs)
+- One IAM role per environment (`{project}-github-actions-{env}`) scoped to `repo:org/repo:environment:{env}`
+- Permissions: S3/DynamoDB state access + broad AWS provisioning (needed to run Terraform)
 
-Store the role ARNs as GitHub Actions secrets:
+> **Note:** These roles are for Terraform CI only (`tf-plan`, `tf-apply` workflows). A separate
+> application-level `DevOpsRole` (for ECR push, ECS deploy, etc.) is created later by the platform
+> stack — see the **Platform IAM** section for the distinction.
+
+Store the Terraform execution role ARNs as GitHub Actions secrets:
 ```
-AWS_ROLE_ARN_DEV
-AWS_ROLE_ARN_QA
-AWS_ROLE_ARN_PROD
-AWS_ROLE_ARN_OPS
+AWS_ROLE_ARN_DEV    # used by tf-plan/tf-apply for the dev environment
+AWS_ROLE_ARN_QA     # used by tf-plan/tf-apply for the qa environment
+AWS_ROLE_ARN_PROD   # used by tf-plan/tf-apply for the prod environment
+```
+
+Then, after the platform stack is deployed (Step 8+), pass the OIDC provider ARN to the platform stack so it can create the `DevOpsRole` for your application repositories:
+```hcl
+# environments/dev/terraform.tfvars
+github_oidc_provider_arn = "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+github_repo_subject      = "repo:your-org/your-app-repo:*"
 ```
 
 ---
@@ -1121,6 +1143,151 @@ Triggers on: manual `workflow_dispatch` with input: `bootstrap_step`
 Steps:
 1. Assume root/ops OIDC role
 2. Run specified bootstrap module
+
+---
+
+## GitHub Repository Environments & Secrets
+
+GitHub **Environments** are named deployment targets (e.g., `dev`, `qa`, `prod`) that you configure in a repo's **Settings → Environments**. They provide:
+
+- **Environment-scoped secrets** — a secret named `AWS_ROLE_ARN` can hold a different value per environment, so workflows always use the right credentials without branching logic
+- **Protection rules** — require specific reviewers or a wait timer before a job targeting `prod` can run
+- **Deployment history** — GitHub tracks every run per environment for audit purposes
+
+---
+
+### Setting Up Environments
+
+In your infrastructure repo (and any application repo that calls these workflows), create an environment for each deployment target:
+
+1. Go to **Settings → Environments → New environment**
+2. Create: `dev`, `qa`, `prod`
+3. For `prod`, add a **Required reviewer** and optionally a **wait timer** (e.g., 5 minutes)
+
+```
+Repo Settings
+└── Environments
+    ├── dev       (no protection rules needed)
+    ├── qa        (optional: require 1 reviewer)
+    └── prod      (required: 1+ reviewers + wait timer)
+```
+
+---
+
+### Secret Scoping: Repository vs. Environment
+
+GitHub supports three secret scopes. Use the right one for each secret type:
+
+| Secret | Scope | Reason |
+|---|---|---|
+| `AWS_ACCESS_KEY_ID` (bootstrap only) | **Repository** | Bootstrap runs before environments exist; deleted after use |
+| `AWS_SECRET_ACCESS_KEY` (bootstrap only) | **Repository** | Same as above |
+| `AWS_ROLE_ARN` | **Environment** (`dev` / `qa` / `prod`) | Different ARN per account/environment; env-scoped prevents prod secrets from leaking to dev jobs |
+
+**Never put environment-specific secrets at repository scope.** A repo-level secret is accessible to all workflows regardless of which environment they target — this means a dev job could accidentally assume a prod role.
+
+---
+
+### Which AWS Account Do Secrets Belong To?
+
+The credentials used at each stage must come from the AWS account where the resources live:
+
+| Stage | Credentials | AWS Account |
+|---|---|---|
+| `bootstrap` workflow (one-time) | IAM user access keys | The **ops/shared-services** account that hosts the Terraform state S3 bucket. In single-account setups, this is your one account. **Never use root keys.** |
+| `tf-plan` / `tf-apply` for `dev` | OIDC role ARN | The **dev account** (or dev namespace in a single account) |
+| `tf-plan` / `tf-apply` for `qa` | OIDC role ARN | The **qa account** |
+| `tf-plan` / `tf-apply` for `prod` | OIDC role ARN | The **prod account** |
+| App deploy workflows (`deploy-service`, `deploy-lambda`, etc.) | OIDC role ARN (DevOpsRole) | Same account as the environment being deployed to |
+
+In a **single AWS account** setup (common for small teams): all environments live in the same account, but use different OIDC roles scoped by environment name in the IAM condition. The OIDC roles are created by `bootstrap/oidc` and output their ARNs after apply.
+
+In a **multi-account** setup: each environment maps to a separate account ID. The `AWS_ROLE_ARN` environment secret for `prod` references an ARN in the production account.
+
+---
+
+### Adding Secrets to Environments
+
+After running the bootstrap workflow, copy the OIDC role ARNs from its output and save them as environment secrets:
+
+```bash
+# The bootstrap workflow prints role ARNs. Example output:
+# {
+#   "dev":  "arn:aws:iam::111111111111:role/myapp-dev-use1-oidc-terraform",
+#   "qa":   "arn:aws:iam::222222222222:role/myapp-qa-use1-oidc-terraform",
+#   "prod": "arn:aws:iam::333333333333:role/myapp-prod-use1-oidc-terraform"
+# }
+```
+
+In **Settings → Environments → dev → Add secret**:
+
+| Secret name | Value |
+|---|---|
+| `AWS_ROLE_ARN` | `arn:aws:iam::111111111111:role/myapp-dev-use1-oidc-terraform` |
+
+Repeat for `qa` and `prod` with their respective ARNs.
+
+For **application repos** that call the deploy workflows, add the **DevOpsRole** ARN (from `stacks/platform` output `devops_role_arn`) as the `AWS_ROLE_ARN` environment secret — not the Terraform execution role. The two roles are distinct:
+
+| Role | Purpose | Who sets it |
+|---|---|---|
+| `oidc-terraform` role | Runs `terraform plan/apply` | `bootstrap/oidc` — set in the infra repo's environments |
+| `DevOpsRole` | Deploys application code (ECR push, ECS update, Lambda update) | `stacks/platform` — set in application repos' environments |
+
+---
+
+### Referencing Environment Secrets in Workflows
+
+A workflow job targets an environment with the `environment:` key. GitHub then injects that environment's secrets for that job only:
+
+```yaml
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    environment: prod          # ← activates prod's secrets + protection rules
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}   # ← prod's value
+          aws-region: us-east-1
+```
+
+For workflows that loop over multiple environments in a matrix:
+
+```yaml
+jobs:
+  apply:
+    strategy:
+      matrix:
+        environment: [dev, qa, prod]
+    environment: ${{ matrix.environment }}   # ← each job gets the right secrets
+
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+```
+
+The `prod` job in this matrix will pause and wait for reviewer approval (if protection rules are set) before the AWS credentials are ever resolved.
+
+---
+
+### Terraform Variables from Secrets
+
+Some Terraform variables (like `github_oidc_provider_arn`) are stable per account and can be stored as environment secrets rather than hardcoded in `terraform.tfvars`:
+
+```yaml
+- name: Terraform apply
+  run: |
+    terraform apply -auto-approve \
+      -var="github_oidc_provider_arn=${{ secrets.OIDC_PROVIDER_ARN }}"
+  env:
+    TF_VAR_github_oidc_provider_arn: ${{ secrets.OIDC_PROVIDER_ARN }}
+```
+
+The `TF_VAR_` prefix pattern lets you pass any Terraform variable via environment variable without exposing it in the plan command line.
 
 ---
 
@@ -1202,6 +1369,312 @@ checkov -d . --framework terraform
 ```bash
 terraform-docs markdown modules/network > modules/network/README.md
 ```
+
+---
+
+---
+
+## Consumer & Organization Usage Guide
+
+This section explains how **other projects and GitHub organizations** can use this template to provision infrastructure, coordinate shared resources across multiple repositories, and manage multi-stack state.
+
+---
+
+### What This Template Handles vs. What Consumers Are Responsible For
+
+| This template provides | Consumer projects are responsible for |
+|---|---|
+| Reusable Terraform modules (`modules/`) | Application source code and business logic |
+| Opinionated stack compositions (`stacks/`) | Choosing which stacks to deploy |
+| Environment wiring (`environments/`) | Populating `terraform.tfvars` with real values |
+| GitHub Actions reusable workflows (`.github/workflows/`) | Calling workflows from their own repos |
+| Bootstrap scripts (OIDC, remote state) | Running bootstrap once per AWS account |
+| Remote state configuration (`config/`) | Pointing state config at the right S3 bucket |
+| IAM roles with least-privilege policies | Granting roles access to their specific resources |
+| Naming conventions and tagging standards | Applying consistent `project`/`environment` values |
+
+---
+
+### Option A — Fork and Own (Recommended for Single Org)
+
+The simplest model: fork this template into your GitHub organization's infrastructure repo and customize it directly.
+
+```
+your-org/
+  myapp-infrastructure/     ← your fork of this template
+    modules/
+    stacks/
+    environments/
+    .github/workflows/
+```
+
+1. Click **"Use this template"** on GitHub to create `your-org/myapp-infrastructure`
+2. Follow the [Bootstrap Runbook](#bootstrap-runbook) to provision remote state and OIDC
+3. Run `terraform apply` in `environments/dev`, then `qa`, then `prod`
+
+All application repos in your org reference the reusable workflows from this infra repo:
+
+```yaml
+# In your-org/my-frontend-app/.github/workflows/deploy.yml
+jobs:
+  deploy:
+    uses: your-org/myapp-infrastructure/.github/workflows/deploy-frontend.yml@main
+    with:
+      environment: prod
+      s3_bucket: myapp-prod-use1-s3-frontend
+      cloudfront_distribution_id: EXXXXXXXXXX
+    secrets:
+      aws_role_arn: ${{ secrets.AWS_ROLE_ARN_PROD }}
+```
+
+---
+
+### Option B — Published Module Registry (Multi-Org / Team Sharing)
+
+For organizations that want multiple teams to consume modules without forking the whole repo, publish specific modules via a git tag and reference them from any Terraform project:
+
+```hcl
+# In any consumer's Terraform code
+module "my_queue" {
+  source = "git::https://github.com/your-org/myapp-infrastructure.git//modules/sqs?ref=v1.2.0"
+
+  project     = "teamb-api"
+  environment = "prod"
+  region      = "us-east-1"
+  queue_name  = "order-events"
+  dlq_enabled = true
+  tags        = { Team = "platform" }
+}
+```
+
+**Versioning strategy:**
+- Tag releases with semantic versions: `git tag v1.2.0 && git push origin v1.2.0`
+- Consumers pin to a tag ref (`?ref=v1.2.0`) — never use `@main` in production
+- Keep a `CHANGELOG.md` noting breaking variable/output changes per module
+
+---
+
+### Option C — Shared Platform + Application Repos (Multi-Repo Model)
+
+The most common enterprise pattern: one infrastructure repo provisions shared platform resources; each application team has its own application repo that deploys onto the shared platform.
+
+```
+your-org/
+  infra-platform/           ← this template (platform team owns)
+    stacks/platform/        ← deploys VPC, ECS cluster, ALBs, IAM roles
+    stacks/data-layer/      ← deploys RDS, ElastiCache, DynamoDB
+    environments/
+
+  team-a/payments-api/      ← application repo (team A owns)
+    src/
+    .github/workflows/
+      deploy.yml            ← calls reusable workflows from infra-platform
+
+  team-b/notification-svc/  ← application repo (team B owns)
+    src/
+    .github/workflows/
+      deploy.yml            ← calls reusable workflows from infra-platform
+```
+
+**How application repos access shared infrastructure state:**
+
+Platform outputs are written to SSM Parameter Store during `terraform apply`. Application repos read them without needing access to Terraform state:
+
+```hcl
+# In an application stack's variables.tf or main.tf
+data "aws_ssm_parameter" "cluster_arn" {
+  name = "/platform/prod/ecs_cluster_arn"
+}
+
+data "aws_ssm_parameter" "private_subnets" {
+  name = "/platform/prod/private_subnet_ids"
+}
+
+# Pass to a module
+module "my_service" {
+  source          = "git::https://github.com/your-org/infra-platform.git//stacks/bff?ref=v2.0.0"
+  ecs_cluster_arn = data.aws_ssm_parameter.cluster_arn.value
+  # ...
+}
+```
+
+Or use the `ssm_prefix` input that every stack supports:
+
+```hcl
+module "payments_api" {
+  source     = "git::https://github.com/your-org/infra-platform.git//stacks/bff?ref=v2.0.0"
+  ssm_prefix = "/platform/prod"   # reads vpc_id, subnets, cluster_arn, etc. automatically
+  # application-specific inputs only
+  service_name    = "payments-api"
+  container_image = "123456789.dkr.ecr.us-east-1.amazonaws.com/payments-api:latest"
+  path_pattern    = "/payments/*"
+}
+```
+
+---
+
+### Calling Reusable Workflows from Application Repos
+
+Application repos call the GitHub Actions reusable workflows from this infra repo. No Terraform knowledge required — workflows accept typed inputs and handle the build/deploy cycle.
+
+**Deploy a Lambda function:**
+
+```yaml
+# your-app/.github/workflows/deploy.yml
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    uses: your-org/infra-platform/.github/workflows/deploy-lambda.yml@main
+    with:
+      environment: prod
+      function_name: myapp-prod-use1-fn-order-processor    # from terraform output
+      s3_bucket: myapp-prod-use1-s3-lambda-artifacts       # from terraform output
+      runtime: python
+      python_version: "3.12"
+    secrets:
+      aws_role_arn: ${{ secrets.AWS_ROLE_ARN_PROD }}
+```
+
+**Deploy a containerized service (ECS Fargate):**
+
+```yaml
+jobs:
+  deploy:
+    uses: your-org/infra-platform/.github/workflows/deploy-service.yml@main
+    with:
+      environment: prod
+      ecr_repository: myapp-prod-use1-ecr-payments-api
+      ecs_cluster: myapp-prod-use1-ecs-main
+      ecs_service: myapp-prod-use1-svc-payments-api
+      container_name: app
+      runtime: nodejs
+    secrets:
+      aws_role_arn: ${{ secrets.AWS_ROLE_ARN_PROD }}
+```
+
+**Deploy a webhook processor (SQS-backed Lambda):**
+
+```yaml
+jobs:
+  deploy:
+    uses: your-org/infra-platform/.github/workflows/deploy-webhook-ingestion.yml@main
+    with:
+      environment: prod
+      processor_function_name: myapp-prod-use1-fn-stripe-webhook-processor  # terraform output: processor_lambda_name
+      s3_bucket: myapp-prod-use1-s3-lambda-artifacts
+      runtime: python
+    secrets:
+      aws_role_arn: ${{ secrets.AWS_ROLE_ARN_PROD }}
+```
+
+**Required secrets** in each application repo (set in GitHub → Settings → Secrets):
+
+| Secret | Value | Source |
+|---|---|---|
+| `AWS_ROLE_ARN_DEV` | `arn:aws:iam::ACCOUNT_ID:role/DevOpsRole` | Platform stack output: `devops_role_arn` |
+| `AWS_ROLE_ARN_QA` | `arn:aws:iam::ACCOUNT_ID:role/DevOpsRole` | Platform stack output: `devops_role_arn` |
+| `AWS_ROLE_ARN_PROD` | `arn:aws:iam::ACCOUNT_ID:role/DevOpsRole` | Platform stack output: `devops_role_arn` |
+
+The `devops_role_arn` is available as a Terraform output from `stacks/platform` and also in SSM at `/platform/{environment}/devops_role_arn`.
+
+---
+
+### Workflow Inputs Reference — Where Values Come From
+
+Every workflow input that references infrastructure (function names, cluster names, S3 buckets) maps directly to a Terraform output. Look them up after running `terraform apply`:
+
+```bash
+# In environments/prod/
+terraform output -json | jq '.'
+```
+
+| Workflow input | Terraform output | Stack |
+|---|---|---|
+| `processor_function_name` | `processor_lambda_name` | `stacks/webhook-ingestion` |
+| `ecs_cluster` | `ecs_cluster_name` | `stacks/ecs-cluster` or `stacks/platform` |
+| `ecs_service` | Constructed: `{project}-{env}-svc-{service_name}` | `stacks/bff` or `stacks/microservice` |
+| `ecr_repository` | Constructed: `{project}-{env}-ecr-{service_name}` | `stacks/bff` or `stacks/microservice` |
+| `s3_bucket` | Provisioned separately or via `modules/s3` | Custom |
+| `cloudfront_distribution_id` | `distribution_id` | `stacks/frontend` |
+| `function_name` | `function_name` | `modules/lambda` |
+
+---
+
+### Multi-Repo State Coordination
+
+When multiple repos or teams manage separate Terraform stacks that share resources, use these patterns to avoid circular dependencies and state coupling.
+
+#### Pattern 1 — SSM Parameter Store (Recommended)
+
+The platform stack writes all outputs to SSM during apply. Downstream stacks read via `data "aws_ssm_parameter"`. No state file access needed.
+
+```
+Platform apply → writes to SSM → App stacks read from SSM
+```
+
+All stacks support `ssm_prefix` for auto-wiring. The SSM path structure is:
+
+```
+/platform/{environment}/vpc_id
+/platform/{environment}/private_subnet_ids
+/platform/{environment}/ecs_cluster_arn
+/platform/{environment}/devops_role_arn
+...
+```
+
+#### Pattern 2 — Remote State Data Source
+
+If two stacks in the same infrastructure repo need to cross-reference outputs directly:
+
+```hcl
+data "terraform_remote_state" "platform" {
+  backend = "s3"
+  config = {
+    bucket = "myapp-prod-tfstate"
+    key    = "prod/platform/terraform.tfstate"
+    region = "us-east-1"
+  }
+}
+
+# Reference the output
+vpc_id = data.terraform_remote_state.platform.outputs.vpc_id
+```
+
+Use this only when both stacks are in the same infrastructure repo and the referencing stack's CI pipeline has access to the state bucket.
+
+#### Pattern 3 — Hardcoded IDs via `terraform.tfvars` (Simple Cases)
+
+For stable, rarely-changing resources (VPC IDs, hosted zone IDs, certificate ARNs), hardcode the IDs in `terraform.tfvars`:
+
+```hcl
+# environments/prod/terraform.tfvars
+vpc_id              = "vpc-0abc1234def56789"
+private_subnet_ids  = ["subnet-aaa", "subnet-bbb", "subnet-ccc"]
+zone_id             = "Z1234567890ABC"
+```
+
+This is the lowest-friction option for simple stacks that change infrequently.
+
+---
+
+### Dependency Order and Apply Sequence
+
+When deploying from scratch into a new environment, apply stacks in this order:
+
+```
+1. bootstrap/state-backend     ← creates S3 + DynamoDB for remote state
+2. bootstrap/oidc              ← creates Terraform execution OIDC role
+3. environments/{env}          ← applies platform stack (network + ECS + IAM + KMS)
+4. stacks/data-layer           ← databases (needs VPC/subnets from platform)
+5. stacks/webhook-ingestion    ← APIGW + SQS + Lambda skeleton
+6. stacks/frontend             ← CloudFront + S3 + ACM
+7. stacks/bff / stacks/microservice ← ECS services (needs cluster + ALBs from platform)
+```
+
+Application CI pipelines (ECR push, ECS deploy, Lambda deploy) run **after** step 3+ are complete, once the infrastructure exists.
 
 ---
 

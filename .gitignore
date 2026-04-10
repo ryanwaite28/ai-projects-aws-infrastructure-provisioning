@@ -1,0 +1,59 @@
+# ── Terraform ──────────────────────────────────────────────────────────────────
+# Local .terraform directories
+**/.terraform/
+
+# Terraform lock file is intentionally committed to track provider versions
+# (remove the next line if you don't want to track it)
+# .terraform.lock.hcl
+
+# Compiled plan files
+*.tfplan
+tfplan
+tfplan-destroy
+
+# State files — never commit remote state
+*.tfstate
+*.tfstate.backup
+*.tfstate.*.backup
+
+# Variables files that may contain secrets
+*.auto.tfvars
+# terraform.tfvars committed in environments/ is intentional (no secrets);
+# add local override files here:
+*.tfvars.local
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Terraform crash logs
+crash.log
+crash.*.log
+
+# Terraform CLI config
+.terraformrc
+terraform.rc
+
+# ── Secrets / credentials ───────────────────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+*credentials*
+*secrets*
+
+# ── OS ──────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Editor / IDE ────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Build / temp ────────────────────────────────────────────────────────────────
+plan_output.txt
+apply_output.txt
+destroy_output.txt

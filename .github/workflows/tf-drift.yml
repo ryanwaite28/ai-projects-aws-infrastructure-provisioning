@@ -1,0 +1,222 @@
+##
+## Reusable workflow: Terraform Drift Detection
+## Called by consuming repositories via:
+##   uses: your-org/infra-modules/.github/workflows/tf-drift.yml@main
+##
+## Runs on a schedule (or manual dispatch). Generates a plan and opens a
+## GitHub Issue if drift is detected (plan has changes). Closing the issue
+## is the human signal that drift has been acknowledged/resolved.
+##
+
+name: Terraform Drift Detection
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: "Path to the Terraform root module"
+        type: string
+        required: true
+      environment:
+        description: "Deployment environment (dev | qa | prod)"
+        type: string
+        required: true
+      aws_region:
+        description: "AWS region"
+        type: string
+        default: "us-east-1"
+      terraform_version:
+        description: "Terraform CLI version"
+        type: string
+        default: "1.9.0"
+      backend_config_file:
+        description: "Relative path to backend config HCL"
+        type: string
+        default: ""
+      var_file:
+        description: "Relative path to tfvars file"
+        type: string
+        default: ""
+      issue_label:
+        description: "Label to attach to drift issues"
+        type: string
+        default: "terraform-drift"
+    secrets:
+      aws_role_arn:
+        description: "IAM role ARN to assume via OIDC"
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+jobs:
+  drift:
+    name: Drift · ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: tf-drift-${{ inputs.environment }}-${{ github.run_id }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Terraform init
+        run: |
+          INIT_ARGS=""
+          if [ -n "${{ inputs.backend_config_file }}" ]; then
+            INIT_ARGS="-backend-config=${{ github.workspace }}/${{ inputs.backend_config_file }}"
+          fi
+          terraform init -input=false $INIT_ARGS
+
+      - name: Terraform plan (drift check)
+        id: plan
+        run: |
+          VAR_FILE_ARG=""
+          if [ -n "${{ inputs.var_file }}" ]; then
+            VAR_FILE_ARG="-var-file=${{ github.workspace }}/${{ inputs.var_file }}"
+          fi
+          set +e
+          terraform plan -detailed-exitcode -input=false -no-color $VAR_FILE_ARG 2>&1 | tee plan_output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "exitcode=$EXIT_CODE" >> $GITHUB_OUTPUT
+          # exitcode 0 = no changes, 1 = error, 2 = changes present
+          exit 0
+
+      - name: Ensure drift issue label exists
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              await github.rest.issues.getLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: '${{ inputs.issue_label }}',
+              });
+            } catch (e) {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: '${{ inputs.issue_label }}',
+                color: 'e4e669',
+                description: 'Terraform drift detected',
+              });
+            }
+
+      - name: Open or update drift issue
+        if: steps.plan.outputs.exitcode == '2'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.existsSync('${{ inputs.working_directory }}/plan_output.txt')
+              ? fs.readFileSync('${{ inputs.working_directory }}/plan_output.txt', 'utf8')
+              : '(no output)';
+            const truncated = planOutput.length > 50000
+              ? planOutput.substring(0, 50000) + '\n\n... (truncated)'
+              : planOutput;
+
+            const title = `[Drift] ${{ inputs.environment }} · ${{ inputs.working_directory }}`;
+            const marker = `<!-- drift-${{ inputs.environment }}-${{ inputs.working_directory }} -->`;
+
+            const body = [
+              marker,
+              `## Infrastructure Drift Detected`,
+              ``,
+              `**Environment:** \`${{ inputs.environment }}\``,
+              `**Module:** \`${{ inputs.working_directory }}\``,
+              `**Detected at:** ${new Date().toISOString()}`,
+              `**Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+              ``,
+              `Terraform detected that the real infrastructure differs from state.`,
+              `Review the plan below and either apply the changes or import/reconcile the drift.`,
+              ``,
+              `<details><summary>Plan output</summary>`,
+              ``,
+              '```hcl',
+              truncated,
+              '```',
+              `</details>`,
+            ].join('\n');
+
+            // Search for an existing open drift issue for this env+module
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: '${{ inputs.issue_label }}',
+            });
+
+            const existing = issues.data.find(i => i.body && i.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body,
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body: `Drift still present as of ${new Date().toISOString()} · Run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+              });
+              core.warning(`Drift issue updated: #${existing.number}`);
+            } else {
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['${{ inputs.issue_label }}'],
+              });
+              core.warning(`Drift issue created: #${created.data.number}`);
+            }
+
+      - name: Close drift issue if no drift
+        if: steps.plan.outputs.exitcode == '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = `<!-- drift-${{ inputs.environment }}-${{ inputs.working_directory }} -->`;
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: '${{ inputs.issue_label }}',
+            });
+            const existing = issues.data.find(i => i.body && i.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body: `✅ Drift resolved as of ${new Date().toISOString()}. Closing.`,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                state: 'closed',
+              });
+            }
+
+      - name: Fail on plan error
+        if: steps.plan.outputs.exitcode == '1'
+        run: exit 1

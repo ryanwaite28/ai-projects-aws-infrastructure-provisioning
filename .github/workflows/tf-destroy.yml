@@ -1,0 +1,124 @@
+##
+## Reusable workflow: Terraform Destroy
+## Called by consuming repositories via:
+##   uses: your-org/infra-modules/.github/workflows/tf-destroy.yml@main
+##
+## Manual dispatch only. Requires explicit confirmation input to prevent
+## accidental destruction. Environment protection rules should be configured
+## in GitHub to require additional approvals for prod.
+##
+
+name: Terraform Destroy
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: "Path to the Terraform root module"
+        type: string
+        required: true
+      environment:
+        description: "Deployment environment (dev | qa | prod)"
+        type: string
+        required: true
+      aws_region:
+        description: "AWS region to deploy into"
+        type: string
+        default: "us-east-1"
+      terraform_version:
+        description: "Terraform CLI version to use"
+        type: string
+        default: "1.9.0"
+      backend_config_file:
+        description: "Relative path to backend config HCL"
+        type: string
+        default: ""
+      var_file:
+        description: "Relative path to tfvars file"
+        type: string
+        default: ""
+      confirm_destroy:
+        description: "Type 'destroy' to confirm (safety gate)"
+        type: string
+        required: true
+    secrets:
+      aws_role_arn:
+        description: "IAM role ARN to assume via OIDC"
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  safety-check:
+    name: Safety Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify confirmation
+        run: |
+          if [ "${{ inputs.confirm_destroy }}" != "destroy" ]; then
+            echo "❌ Confirmation input must be exactly 'destroy'. Got: '${{ inputs.confirm_destroy }}'"
+            exit 1
+          fi
+          echo "✅ Confirmation accepted. Proceeding with destroy."
+
+  destroy:
+    name: Destroy · ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    needs: safety-check
+    environment: ${{ inputs.environment }}
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: tf-destroy-${{ inputs.environment }}-${{ github.run_id }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Terraform init
+        run: |
+          INIT_ARGS=""
+          if [ -n "${{ inputs.backend_config_file }}" ]; then
+            INIT_ARGS="-backend-config=${{ github.workspace }}/${{ inputs.backend_config_file }}"
+          fi
+          terraform init -input=false $INIT_ARGS
+
+      - name: Terraform plan destroy
+        run: |
+          VAR_FILE_ARG=""
+          if [ -n "${{ inputs.var_file }}" ]; then
+            VAR_FILE_ARG="-var-file=${{ github.workspace }}/${{ inputs.var_file }}"
+          fi
+          terraform plan -destroy -input=false -no-color -out=tfplan-destroy $VAR_FILE_ARG
+
+      - name: Terraform destroy
+        run: terraform apply -destroy -input=false -no-color -auto-approve tfplan-destroy 2>&1 | tee destroy_output.txt
+
+      - name: Post destroy summary
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const out = fs.existsSync('${{ inputs.working_directory }}/destroy_output.txt')
+              ? fs.readFileSync('${{ inputs.working_directory }}/destroy_output.txt', 'utf8')
+              : '(no output)';
+            await core.summary
+              .addHeading(`🔥 Terraform Destroy · \`${{ inputs.environment }}\` · \`${{ inputs.working_directory }}\``)
+              .addCodeBlock(out.substring(0, 30000), 'hcl')
+              .addRaw(`*Actor: @${{ github.actor }} · Run [${context.runId}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*`)
+              .write();

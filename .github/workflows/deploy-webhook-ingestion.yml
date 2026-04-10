@@ -1,0 +1,369 @@
+##
+## Reusable workflow: Deploy Webhook Ingestion Processor
+##
+## Stack pattern (infrastructure, provisioned by stacks/webhook-ingestion):
+##
+##   Internet ──POST /webhooks──► API Gateway (REST, regional)
+##                                     │  AWS service integration
+##                                     │  Returns HTTP 200 immediately — no Lambda in hot path
+##                                     ▼
+##                               SQS Standard Queue
+##                                     │  Event source mapping
+##                                     ▼
+##                               Processor Lambda  ◄── THIS workflow deploys code here
+##
+## This workflow builds and deploys ONLY the processor Lambda. The API Gateway
+## and SQS queue are pure infrastructure managed by Terraform — no application
+## code runs in the ingestion path.
+##
+## The processor Lambda receives SQS events where each record's `body` field
+## contains the original webhook JSON payload. Example handler (Python):
+##
+##   import json
+##   def process(event, context):
+##       for record in event['Records']:
+##           payload = json.loads(record['body'])
+##           # ... your business logic here
+##
+## Usage in a calling repo:
+##
+##   jobs:
+##     deploy:
+##       uses: your-org/infra-modules/.github/workflows/deploy-webhook-ingestion.yml@main
+##       with:
+##         environment: prod
+##         processor_function_name: myapp-prod-use1-fn-stripe-webhook-processor
+##         s3_bucket: myapp-prod-use1-s3-lambda-artifacts
+##         runtime: python
+##       secrets:
+##         aws_role_arn: ${{ secrets.AWS_ROLE_ARN_PROD }}
+##
+## The processor_function_name is available as an output from the
+## stacks/webhook-ingestion Terraform stack: processor_lambda_name
+##
+
+name: Deploy Webhook Processor
+
+on:
+  workflow_call:
+    inputs:
+      # ── Targeting ────────────────────────────────────────────────────────────
+      environment:
+        description: "Target environment (dev | qa | prod)"
+        type: string
+        required: true
+      aws_region:
+        description: "AWS region"
+        type: string
+        default: "us-east-1"
+      working_directory:
+        description: "Directory containing the processor Lambda source code"
+        type: string
+        default: "."
+
+      # ── Lambda identity ───────────────────────────────────────────────────────
+      processor_function_name:
+        description: |
+          Processor Lambda function name.
+          Get this from the stacks/webhook-ingestion output: processor_lambda_name
+        type: string
+        required: true
+
+      # ── Runtime ───────────────────────────────────────────────────────────────
+      runtime:
+        description: "Build runtime: python | nodejs | java-maven | java-gradle | go | zip-only"
+        type: string
+        default: "python"
+      python_version:
+        description: "Python version (python runtime)"
+        type: string
+        default: "3.12"
+      node_version:
+        description: "Node.js version (nodejs runtime)"
+        type: string
+        default: "20"
+      java_version:
+        description: "Java version (java-* runtimes)"
+        type: string
+        default: "21"
+      java_distribution:
+        description: "JDK distribution: corretto | temurin | zulu"
+        type: string
+        default: "corretto"
+      go_version:
+        description: "Go version (go runtime)"
+        type: string
+        default: "1.22"
+      go_binary_name:
+        description: "Output binary name for Go (default: bootstrap for provided.al2)"
+        type: string
+        default: "bootstrap"
+      build_command:
+        description: "Override the default build command for the selected runtime"
+        type: string
+        default: ""
+      artifact_path:
+        description: "Pre-built artifact path relative to working_directory (zip-only runtime)"
+        type: string
+        default: ""
+
+      # ── S3 artifact storage ───────────────────────────────────────────────────
+      s3_bucket:
+        description: "S3 bucket to upload the deployment package to"
+        type: string
+        required: true
+      s3_prefix:
+        description: "S3 key prefix (default: lambda/)"
+        type: string
+        default: "lambda/"
+
+      # ── Lambda update options ─────────────────────────────────────────────────
+      publish_version:
+        description: "Publish a new Lambda version after deploy (enables alias routing)"
+        type: string
+        default: "false"
+      update_alias:
+        description: "Alias name to point at the new version (requires publish_version=true)"
+        type: string
+        default: ""
+
+    secrets:
+      aws_role_arn:
+        description: "IAM role ARN to assume via OIDC (DevOpsRole from platform stack)"
+        required: true
+
+    outputs:
+      s3_key:
+        description: "S3 key of the uploaded artifact"
+        value: ${{ jobs.deploy.outputs.s3_key }}
+      processor_function_arn:
+        description: "Processor Lambda ARN after update"
+        value: ${{ jobs.deploy.outputs.function_arn }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Webhook Processor · ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    outputs:
+      s3_key:       ${{ steps.upload.outputs.s3_key }}
+      function_arn: ${{ steps.update-code.outputs.function_arn }}
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Language toolchain ────────────────────────────────────────────────
+
+      - name: Set up Python ${{ inputs.python_version }}
+        if: inputs.runtime == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Set up Node.js ${{ inputs.node_version }}
+        if: inputs.runtime == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Set up Java ${{ inputs.java_version }} (${{ inputs.java_distribution }})
+        if: startsWith(inputs.runtime, 'java')
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: ${{ inputs.java_distribution }}
+          cache: ${{ inputs.runtime == 'java-maven' && 'maven' || 'gradle' }}
+
+      - name: Set up Go ${{ inputs.go_version }}
+        if: inputs.runtime == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: true
+
+      # ── Build ─────────────────────────────────────────────────────────────
+
+      - name: Build (Python)
+        if: inputs.runtime == 'python'
+        run: |
+          if [ -n "${{ inputs.build_command }}" ]; then
+            ${{ inputs.build_command }}
+          else
+            # Install dependencies with manylinux wheels for Lambda compatibility.
+            pip install \
+              --platform manylinux2014_x86_64 \
+              --target=./package \
+              --implementation cp \
+              --python-version ${{ inputs.python_version }} \
+              --only-binary=:all: \
+              --upgrade \
+              -r requirements.txt 2>/dev/null || \
+            pip install -r requirements.txt -t ./package
+            cd package && zip -r ../deployment.zip . && cd ..
+            zip -r deployment.zip . \
+              --exclude "package/*" \
+              --exclude "*.pyc" \
+              --exclude "__pycache__/*" \
+              --exclude "tests/*" \
+              --exclude ".git/*"
+          fi
+          echo "artifact=deployment.zip" >> $GITHUB_ENV
+
+      - name: Build (Node.js)
+        if: inputs.runtime == 'nodejs'
+        run: |
+          if [ -n "${{ inputs.build_command }}" ]; then
+            ${{ inputs.build_command }}
+          else
+            npm ci --omit=dev
+            if grep -q '"build"' package.json 2>/dev/null; then npm run build; fi
+            zip -r deployment.zip . \
+              --exclude ".git/*" \
+              --exclude "*.test.*" \
+              --exclude "**/__tests__/*"
+          fi
+          echo "artifact=deployment.zip" >> $GITHUB_ENV
+
+      - name: Build (Java / Maven)
+        if: inputs.runtime == 'java-maven'
+        run: |
+          if [ -n "${{ inputs.build_command }}" ]; then
+            ${{ inputs.build_command }}
+          else
+            mvn --batch-mode package -DskipTests
+          fi
+          JAR=$(find target -name "*-shaded.jar" -o -name "*-all.jar" 2>/dev/null | head -1)
+          [ -z "$JAR" ] && JAR=$(find target -name "*.jar" ! -name "*-sources.jar" ! -name "*-javadoc.jar" | head -1)
+          echo "artifact=$JAR" >> $GITHUB_ENV
+
+      - name: Build (Java / Gradle)
+        if: inputs.runtime == 'java-gradle'
+        run: |
+          if [ -n "${{ inputs.build_command }}" ]; then
+            ${{ inputs.build_command }}
+          else
+            chmod +x ./gradlew
+            ./gradlew build shadowJar -x test 2>/dev/null || ./gradlew build -x test
+          fi
+          JAR=$(find build/libs -name "*-all.jar" -o -name "*-fat.jar" 2>/dev/null | head -1)
+          [ -z "$JAR" ] && JAR=$(find build/libs -name "*.jar" ! -name "*-plain.jar" | head -1)
+          echo "artifact=$JAR" >> $GITHUB_ENV
+
+      - name: Build (Go)
+        if: inputs.runtime == 'go'
+        run: |
+          if [ -n "${{ inputs.build_command }}" ]; then
+            ${{ inputs.build_command }}
+          else
+            GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
+              -ldflags="-s -w" \
+              -o "${{ inputs.go_binary_name }}" \
+              ./...
+            zip deployment.zip "${{ inputs.go_binary_name }}"
+          fi
+          echo "artifact=deployment.zip" >> $GITHUB_ENV
+
+      - name: Use pre-built artifact (zip-only)
+        if: inputs.runtime == 'zip-only'
+        run: |
+          if [ -z "${{ inputs.artifact_path }}" ]; then
+            echo "ERROR: artifact_path must be set when runtime=zip-only"; exit 1
+          fi
+          echo "artifact=${{ inputs.artifact_path }}" >> $GITHUB_ENV
+
+      # ── Deploy ────────────────────────────────────────────────────────────
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: deploy-webhook-${{ inputs.environment }}-${{ github.run_id }}
+
+      - name: Upload artifact to S3
+        id: upload
+        run: |
+          SHORT_SHA="${{ github.sha }}"
+          SHORT_SHA="${SHORT_SHA:0:7}"
+          FILENAME=$(basename "${{ env.artifact }}")
+          EXT="${FILENAME##*.}"
+          KEY="${{ inputs.s3_prefix }}${{ inputs.processor_function_name }}/${SHORT_SHA}.${EXT}"
+          aws s3 cp "${{ env.artifact }}" "s3://${{ inputs.s3_bucket }}/${KEY}"
+          echo "s3_key=$KEY" >> $GITHUB_OUTPUT
+          echo "Uploaded: s3://${{ inputs.s3_bucket }}/${KEY}"
+
+      - name: Update processor Lambda code
+        id: update-code
+        run: |
+          ARN=$(aws lambda update-function-code \
+            --function-name "${{ inputs.processor_function_name }}" \
+            --s3-bucket "${{ inputs.s3_bucket }}" \
+            --s3-key "${{ steps.upload.outputs.s3_key }}" \
+            --query 'FunctionArn' \
+            --output text)
+          echo "function_arn=$ARN" >> $GITHUB_OUTPUT
+
+      - name: Wait for update to complete
+        run: |
+          aws lambda wait function-updated \
+            --function-name "${{ inputs.processor_function_name }}"
+
+      - name: Publish Lambda version
+        id: publish
+        if: inputs.publish_version == 'true'
+        run: |
+          VERSION=$(aws lambda publish-version \
+            --function-name "${{ inputs.processor_function_name }}" \
+            --description "Deployed from ${{ github.sha }} by ${{ github.actor }}" \
+            --query 'Version' \
+            --output text)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Update alias
+        if: inputs.publish_version == 'true' && inputs.update_alias != ''
+        run: |
+          aws lambda update-alias \
+            --function-name "${{ inputs.processor_function_name }}" \
+            --name "${{ inputs.update_alias }}" \
+            --function-version "${{ steps.publish.outputs.version }}" \
+            2>/dev/null || \
+          aws lambda create-alias \
+            --function-name "${{ inputs.processor_function_name }}" \
+            --name "${{ inputs.update_alias }}" \
+            --function-version "${{ steps.publish.outputs.version }}"
+
+      - name: Deployment summary
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const ok = '${{ job.status }}' === 'success';
+            await core.summary
+              .addHeading(`${ok ? '✅' : '❌'} Webhook Processor Deployed · \`${{ inputs.environment }}\``)
+              .addTable([
+                [{data: 'Field', header: true}, {data: 'Value', header: true}],
+                ['Function', '`${{ inputs.processor_function_name }}`'],
+                ['Runtime', '`${{ inputs.runtime }}`'],
+                ['S3 artifact', '`${{ steps.upload.outputs.s3_key }}`'],
+                ['Commit', `\`${{ github.sha }}`.substring(0, 7) + '\`'],
+                ['Actor', `@${{ github.actor }}`],
+              ])
+              .addDetails('Stack pattern', [
+                'API Gateway (REST v1) → SQS → **this processor Lambda**',
+                '',
+                'The API Gateway writes directly to SQS and returns HTTP 200 with no',
+                'Lambda in the ingestion path. This Lambda processes queued payloads.',
+                '',
+                `Each SQS record's \`body\` field contains the original webhook JSON.`,
+              ].join('\n'))
+              .write();

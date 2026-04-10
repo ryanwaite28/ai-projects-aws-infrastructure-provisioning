@@ -1,0 +1,185 @@
+##
+## Reusable workflow: Bootstrap
+## Called by consuming repositories via:
+##   uses: your-org/infra-modules/.github/workflows/bootstrap.yml@main
+##
+## ONE-TIME setup workflow. Bootstraps the Terraform state backend (S3 +
+## DynamoDB) and GitHub OIDC identity provider + IAM roles. Must be run
+## with long-lived credentials (AWS access keys stored as secrets) since
+## OIDC does not yet exist. After bootstrap, all subsequent workflows
+## use OIDC exclusively.
+##
+## Steps:
+##   1. bootstrap/state-backend  — S3 bucket + DynamoDB table
+##   2. bootstrap/oidc           — OIDC provider + per-env IAM roles
+##
+
+name: Bootstrap
+
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        description: "Primary AWS region"
+        type: string
+        default: "us-east-1"
+      terraform_version:
+        description: "Terraform CLI version"
+        type: string
+        default: "1.9.0"
+      project:
+        description: "Project name (used in resource naming)"
+        type: string
+        required: true
+      state_bucket_name:
+        description: "S3 bucket name for Terraform state"
+        type: string
+        required: true
+      lock_table_name:
+        description: "DynamoDB table name for state locking"
+        type: string
+        required: true
+      github_org:
+        description: "GitHub org or user that owns the calling repository"
+        type: string
+        required: true
+      github_repo:
+        description: "GitHub repository name (without org prefix)"
+        type: string
+        required: true
+      environments:
+        description: "Comma-separated list of environments to create OIDC roles for (e.g. dev,qa,prod)"
+        type: string
+        default: "dev,qa,prod"
+    secrets:
+      aws_access_key_id:
+        description: |
+          Bootstrap AWS access key ID.
+
+          WHICH ACCOUNT: This must be an IAM user in the same AWS account(s)
+          where state backend and OIDC resources will be created. In a
+          single-account setup that is your one AWS account. In a multi-account
+          setup it is typically an "ops" or "shared-services" account that owns
+          the Terraform state S3 bucket, and the target account(s) for OIDC
+          roles (dev, qa, prod each get their own OIDC role in their own account).
+
+          NEVER use root account credentials. Create a dedicated IAM user
+          (e.g., "terraform-bootstrap") with the minimum permissions needed:
+            - s3:CreateBucket, s3:PutBucketVersioning, s3:PutBucketEncryption,
+              s3:PutPublicAccessBlock (for state backend)
+            - dynamodb:CreateTable (for state locking)
+            - iam:CreateOpenIDConnectProvider, iam:CreateRole, iam:AttachRolePolicy,
+              iam:PutRolePolicy (for OIDC bootstrap)
+
+          LIFECYCLE: Delete this IAM user and rotate/delete this secret immediately
+          after bootstrap succeeds. All subsequent workflows use OIDC — no
+          long-lived credentials ever touch the repo again.
+
+          SCOPE: Set this as a repository-level secret (not an environment secret)
+          since the bootstrap job runs before any GitHub environment exists.
+        required: true
+      aws_secret_access_key:
+        description: |
+          Bootstrap AWS secret access key. See aws_access_key_id description
+          for account, permission, and lifecycle guidance. Store alongside
+          aws_access_key_id as a repository-level secret and delete both
+          immediately after bootstrap completes successfully.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  state-backend:
+    name: Bootstrap State Backend
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: bootstrap/state-backend
+
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.aws_access_key_id }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.aws_secret_access_key }}
+      AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Terraform init (local backend)
+        run: terraform init -input=false
+
+      - name: Terraform plan
+        run: |
+          terraform plan -input=false -no-color \
+            -var="project=${{ inputs.project }}" \
+            -var="region=${{ inputs.aws_region }}" \
+            -var="bucket_name=${{ inputs.state_bucket_name }}" \
+            -var="lock_table_name=${{ inputs.lock_table_name }}"
+
+      - name: Terraform apply
+        run: |
+          terraform apply -input=false -auto-approve -no-color \
+            -var="project=${{ inputs.project }}" \
+            -var="region=${{ inputs.aws_region }}" \
+            -var="bucket_name=${{ inputs.state_bucket_name }}" \
+            -var="lock_table_name=${{ inputs.lock_table_name }}"
+
+  oidc:
+    name: Bootstrap OIDC + IAM Roles
+    runs-on: ubuntu-latest
+    needs: state-backend
+
+    defaults:
+      run:
+        working-directory: bootstrap/oidc
+
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.aws_access_key_id }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.aws_secret_access_key }}
+      AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Terraform init (local backend)
+        run: terraform init -input=false
+
+      - name: Terraform plan
+        run: |
+          terraform plan -input=false -no-color \
+            -var="project=${{ inputs.project }}" \
+            -var="region=${{ inputs.aws_region }}" \
+            -var="github_org=${{ inputs.github_org }}" \
+            -var="github_repo=${{ inputs.github_repo }}" \
+            -var="environments=${{ inputs.environments }}"
+
+      - name: Terraform apply
+        run: |
+          terraform apply -input=false -auto-approve -no-color \
+            -var="project=${{ inputs.project }}" \
+            -var="region=${{ inputs.aws_region }}" \
+            -var="github_org=${{ inputs.github_org }}" \
+            -var="github_repo=${{ inputs.github_repo }}" \
+            -var="environments=${{ inputs.environments }}"
+
+      - name: Print OIDC role ARNs
+        run: |
+          echo "=== OIDC Role ARNs ==="
+          terraform output -json role_arns || true
+          echo ""
+          echo "Store these ARNs as GitHub Secrets named:"
+          echo "  AWS_ROLE_ARN_DEV, AWS_ROLE_ARN_QA, AWS_ROLE_ARN_PROD"
+          echo "(or per your environment naming convention)"
