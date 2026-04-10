@@ -1325,6 +1325,48 @@ tags = {
 - State file path convention: `{environment}/{stack}/terraform.tfstate`
 - Cross-stack data sharing via `terraform_remote_state` data sources or SSM Parameter Store outputs
 
+#### How `config/backend-*.hcl` works
+
+Terraform does not allow variables inside `terraform {}` blocks, so the backend cannot be parameterized directly in `.tf` files. The solution is a **partial backend configuration**:
+
+Each environment root (`environments/dev/main.tf`, etc.) declares an intentionally empty backend:
+
+```hcl
+terraform {
+  backend "s3" {
+    # Values supplied at init time via: -backend-config=config/backend-dev.hcl
+  }
+}
+```
+
+The `config/backend-<env>.hcl` file supplies the missing values at `terraform init` time:
+
+```hcl
+# config/backend-dev.hcl
+bucket         = "myapp-terraform-state"    # S3 bucket (shared per account)
+key            = "dev/terraform.tfstate"    # path within bucket — scoped to this environment
+region         = "us-east-1"               # where the bucket lives
+dynamodb_table = "myapp-terraform-locks"    # shared lock table
+encrypt        = true
+```
+
+Terraform merges the `.hcl` file into the empty block at init time. All subsequent `plan`, `apply`, and `destroy` calls use the resolved backend automatically.
+
+**One bucket and one DynamoDB table serve all stacks within an account.** DynamoDB locks are keyed by the state `key` path, so concurrent runs on different stacks never block each other:
+
+```
+myapp-terraform-state/
+  dev/terraform.tfstate           ← locked independently
+  dev/payments/terraform.tfstate  ← separate lock, separate state
+  prod/terraform.tfstate
+```
+
+In GitHub Actions, the workflow selects the correct file via the `environment` input:
+
+```bash
+terraform init -backend-config=config/backend-${{ inputs.environment }}.hcl
+```
+
 ### Module Versioning
 - Modules are versioned using git tags: `modules/network/v1.2.0`
 - Stacks pin to module versions; environments pin to stack versions

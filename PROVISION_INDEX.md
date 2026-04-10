@@ -305,6 +305,71 @@ jobs:
 
 ---
 
+## Remote State & Backend Configuration
+
+### How it works
+
+Terraform requires a backend to store state remotely, but does **not** allow variables inside `terraform {}` blocks. The solution used here is a **partial backend configuration**:
+
+Each environment root (`environments/dev/main.tf`, etc.) declares an empty backend block:
+
+```hcl
+terraform {
+  backend "s3" {
+    # Values supplied at init time via: -backend-config=config/backend-dev.hcl
+  }
+}
+```
+
+The `config/backend-<env>.hcl` file provides the actual values at `terraform init` time:
+
+```hcl
+# config/backend-dev.hcl
+bucket         = "myapp-terraform-state"   # S3 bucket (shared per AWS account)
+key            = "dev/terraform.tfstate"   # object path — scoped to this environment
+region         = "us-east-1"
+dynamodb_table = "myapp-terraform-locks"   # shared lock table
+encrypt        = true
+```
+
+Terraform merges the `.hcl` file into the empty block at init. All subsequent `plan`/`apply`/`destroy` runs use the resolved config automatically — no flags needed after init.
+
+### Shared per account, isolated by key path
+
+One S3 bucket and one DynamoDB table serve all stacks within the same AWS account. Different stacks get different state files by using different `key` paths:
+
+```
+myapp-terraform-state/           ← one bucket per account
+  dev/terraform.tfstate          ← dev environment
+  qa/terraform.tfstate           ← qa environment
+  prod/terraform.tfstate         ← prod environment
+  dev/payments/terraform.tfstate ← additional stacks use sub-paths
+```
+
+DynamoDB locks are keyed by the state file path, so concurrent Terraform runs on different stacks never block each other.
+
+### Multi-account isolation
+
+In a multi-account org (recommended for prod), each AWS account gets its own bucket and table — provisioned once by `bootstrap/state-backend`. This means:
+
+- A compromised CI role in the dev account cannot read prod state
+- Terraform state (which contains plaintext secrets) never crosses account boundaries
+- The same `config/backend-<env>.hcl` pattern works across all accounts; just point `bucket` at the account-specific bucket name
+
+### GitHub Actions usage
+
+The workflow selects the right backend config based on the `environment` input:
+
+```bash
+terraform init -backend-config=config/backend-${{ inputs.environment }}.hcl
+terraform plan  # uses the resolved backend automatically
+terraform apply
+```
+
+The `backend-*.hcl` files are committed to the repo (they contain no secrets — just bucket names and region).
+
+---
+
 ## Dependency Order for Fresh Deploys
 
 Apply in this order on a new environment:
