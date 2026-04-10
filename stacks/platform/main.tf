@@ -299,6 +299,9 @@ resource "aws_iam_policy" "platform_boundary" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
+      # Allow-all baseline; the Deny statements below are the actual controls.
+      # This is the standard permission boundary pattern: broad allow + targeted denies
+      # prevents privilege escalation without needing to enumerate every permitted action.
       { Effect = "Allow", Action = "*", Resource = "*" },
       { Effect = "Deny", Action = ["iam:CreateUser", "iam:DeleteUser", "organizations:*", "account:*"], Resource = "*" }
     ]

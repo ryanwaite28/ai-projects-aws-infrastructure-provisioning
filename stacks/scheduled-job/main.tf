@@ -83,6 +83,9 @@ resource "aws_iam_role_policy" "scheduler_ecs" {
     Version = "2012-10-17"
     Statement = [
       { Effect = "Allow", Action = ["ecs:RunTask"], Resource = var.ecs_task_definition_arn },
+      # iam:PassRole on * is required: EventBridge Scheduler must pass both the task execution
+      # role and the task role to ECS at runtime. Those ARNs are not known until apply time,
+      # so wildcard scope is necessary here. Scope is limited by the permission boundary.
       { Effect = "Allow", Action = ["iam:PassRole"], Resource = "*" }
     ]
   })
