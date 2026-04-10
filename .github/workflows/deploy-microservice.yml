@@ -1,0 +1,435 @@
+##
+## Reusable workflow: Deploy Microservice (ECS Fargate via Terraform)
+##
+## Builds a Docker image, pushes it to ECR, then runs `terraform apply` on the
+## stacks/microservice root with the new image URI passed as a variable. This
+## keeps Terraform state authoritative — the task definition and ECS service are
+## always reconciled through state, never updated out-of-band.
+##
+## The microservice stack registers a path-based listener rule on the PRIVATE ALB.
+## It is intended for internal service-to-service traffic, not public-facing APIs.
+## For public/user-facing services, use deploy-bff.yml instead.
+##
+## Prerequisites (provisioned separately by the platform stack):
+##   - ECS cluster
+##   - Private ALB with HTTPS listener
+##   - Shared task execution role
+##   - Shared ECS tasks security group
+##   - Platform SSM parameters (or direct var overrides)
+##
+## Usage in a calling repo:
+##
+##   jobs:
+##     deploy:
+##       uses: your-org/infra-modules/.github/workflows/deploy-microservice.yml@main
+##       with:
+##         environment:          prod
+##         service_name:         payments-svc
+##         stack_directory:      stacks/microservice
+##         backend_config_file:  config/backend-prod.hcl
+##         var_file:             environments/prod/payments-svc.tfvars
+##         ecr_repository:       myapp/prod/payments-svc
+##         runtime:              java-maven
+##       secrets:
+##         aws_role_arn: ${{ secrets.AWS_ROLE_ARN }}
+##
+
+name: Deploy Microservice
+
+on:
+  workflow_call:
+    inputs:
+      # ── Targeting ────────────────────────────────────────────────────────────
+      environment:
+        description: "Target environment (dev | qa | prod)"
+        type: string
+        required: true
+      aws_region:
+        description: "AWS region"
+        type: string
+        default: "us-east-1"
+      working_directory:
+        description: "Directory containing the service source code and Dockerfile"
+        type: string
+        default: "."
+
+      # ── Runtime / Build ──────────────────────────────────────────────────────
+      runtime:
+        description: "Build runtime: docker-only | nodejs | python | java-maven | java-gradle | go"
+        type: string
+        default: "docker-only"
+      node_version:
+        description: "Node.js version (nodejs runtime)"
+        type: string
+        default: "20"
+      node_package_manager:
+        description: "Package manager for Node.js: npm | yarn | pnpm"
+        type: string
+        default: "npm"
+      java_version:
+        description: "Java version (java-maven or java-gradle runtime)"
+        type: string
+        default: "21"
+      java_distribution:
+        description: "JDK distribution: temurin | corretto | zulu"
+        type: string
+        default: "corretto"
+      python_version:
+        description: "Python version (python runtime)"
+        type: string
+        default: "3.12"
+      go_version:
+        description: "Go version (go runtime)"
+        type: string
+        default: "1.22"
+      build_command:
+        description: "Override the default pre-Docker build command for the selected runtime"
+        type: string
+        default: ""
+
+      # ── Docker ───────────────────────────────────────────────────────────────
+      dockerfile_path:
+        description: "Path to Dockerfile (relative to working_directory)"
+        type: string
+        default: "Dockerfile"
+      docker_build_args:
+        description: "Newline-separated Docker build args (e.g. APP_ENV=prod)"
+        type: string
+        default: ""
+      docker_build_target:
+        description: "Docker build target stage (multi-stage builds)"
+        type: string
+        default: ""
+      image_tag_extra:
+        description: "Additional tag to apply to the image (e.g. a semver). SHA is always applied."
+        type: string
+        default: ""
+
+      # ── ECR ──────────────────────────────────────────────────────────────────
+      ecr_repository:
+        description: "ECR repository name matching the one created by the microservice stack"
+        type: string
+        required: true
+
+      # ── Terraform ────────────────────────────────────────────────────────────
+      terraform_version:
+        description: "Terraform CLI version"
+        type: string
+        default: "1.9.0"
+      stack_directory:
+        description: "Path to the microservice stack Terraform root (contains main.tf)"
+        type: string
+        required: true
+      backend_config_file:
+        description: "Relative path to the backend config HCL file (e.g. config/backend-prod.hcl)"
+        type: string
+        required: true
+      var_file:
+        description: "Relative path to a tfvars file for this service (e.g. environments/prod/payments-svc.tfvars)"
+        type: string
+        default: ""
+      terraform_vars:
+        description: |
+          Newline-separated extra Terraform variables to pass as -var flags.
+          Format: KEY=VALUE (one per line). Do not include container_image — it is set automatically.
+          Example:
+            desired_count=3
+            task_cpu=1024
+        type: string
+        default: ""
+      deployment_wait_minutes:
+        description: "Minutes to wait for ECS service stability after apply (0 = skip)"
+        type: number
+        default: 10
+
+    secrets:
+      aws_role_arn:
+        description: |
+          IAM role ARN to assume via OIDC.
+          Use the DevOpsRole created by the platform stack (not the Terraform execution role).
+          Must have: ECR push + ECS describe + Terraform state read/write + SSM read.
+        required: true
+
+    outputs:
+      image_uri:
+        description: "Full ECR image URI that was deployed (repo:sha)"
+        value: ${{ jobs.build.outputs.image_uri }}
+      task_definition_arn:
+        description: "ARN of the task definition revision Terraform registered"
+        value: ${{ jobs.deploy.outputs.task_definition_arn }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # ── Job 1: Build and push Docker image to ECR ───────────────────────────────
+  build:
+    name: Build & Push · ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_uri:       ${{ steps.push.outputs.image_uri }}
+      image_uri_latest: ${{ steps.meta.outputs.image_uri_latest }}
+      short_sha:       ${{ steps.meta.outputs.short_sha }}
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Language toolchain setup (skip for docker-only) ───────────────────
+
+      - name: Set up Node.js ${{ inputs.node_version }}
+        if: inputs.runtime == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: ${{ inputs.node_package_manager }}
+          cache-dependency-path: ${{ inputs.working_directory }}/package-lock.json
+
+      - name: Set up Java ${{ inputs.java_version }} (${{ inputs.java_distribution }})
+        if: startsWith(inputs.runtime, 'java')
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: ${{ inputs.java_distribution }}
+          cache: ${{ inputs.runtime == 'java-maven' && 'maven' || 'gradle' }}
+
+      - name: Set up Python ${{ inputs.python_version }}
+        if: inputs.runtime == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Set up Go ${{ inputs.go_version }}
+        if: inputs.runtime == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: true
+
+      # ── Pre-Docker artifact build ──────────────────────────────────────────
+
+      - name: Build artifact (pre-Docker)
+        if: inputs.runtime != 'docker-only'
+        run: |
+          if [ -n "${{ inputs.build_command }}" ]; then
+            ${{ inputs.build_command }}
+          else
+            case "${{ inputs.runtime }}" in
+              nodejs)
+                case "${{ inputs.node_package_manager }}" in
+                  yarn) yarn install --frozen-lockfile && yarn build ;;
+                  pnpm) pnpm install --frozen-lockfile && pnpm run build ;;
+                  *)    npm ci && npm run build ;;
+                esac
+                ;;
+              java-maven)
+                mvn --batch-mode package -DskipTests
+                ;;
+              java-gradle)
+                chmod +x ./gradlew
+                ./gradlew build -x test
+                ;;
+              python)
+                echo "No default pre-build for Python — Dockerfile handles dependencies."
+                ;;
+              go)
+                go build ./...
+                ;;
+            esac
+          fi
+
+      # ── AWS + ECR login ────────────────────────────────────────────────────
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: deploy-msvc-build-${{ inputs.environment }}-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── Docker build + push ────────────────────────────────────────────────
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          REGISTRY="${{ steps.ecr-login.outputs.registry }}"
+          REPO="${{ inputs.ecr_repository }}"
+          SHA="${{ github.sha }}"
+          SHORT_SHA="${SHA:0:7}"
+          echo "registry=$REGISTRY"                           >> $GITHUB_OUTPUT
+          echo "image_uri_sha=${REGISTRY}/${REPO}:${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "image_uri_latest=${REGISTRY}/${REPO}:latest"   >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA"                          >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          TARGET_ARG=""
+          [ -n "${{ inputs.docker_build_target }}" ] && TARGET_ARG="--target ${{ inputs.docker_build_target }}"
+
+          BUILD_ARGS=""
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            BUILD_ARGS="$BUILD_ARGS --build-arg $line"
+          done <<< "${{ inputs.docker_build_args }}"
+
+          docker build \
+            --file "${{ inputs.dockerfile_path }}" \
+            --tag "${{ steps.meta.outputs.image_uri_sha }}" \
+            --tag "${{ steps.meta.outputs.image_uri_latest }}" \
+            --label "git.sha=${{ github.sha }}" \
+            --label "git.ref=${{ github.ref }}" \
+            --label "build.run=${{ github.run_id }}" \
+            $TARGET_ARG $BUILD_ARGS .
+
+      - name: Push image to ECR
+        id: push
+        run: |
+          docker push "${{ steps.meta.outputs.image_uri_sha }}"
+          docker push "${{ steps.meta.outputs.image_uri_latest }}"
+
+          if [ -n "${{ inputs.image_tag_extra }}" ]; then
+            EXTRA_URI="${{ steps.meta.outputs.registry }}/${{ inputs.ecr_repository }}:${{ inputs.image_tag_extra }}"
+            docker tag "${{ steps.meta.outputs.image_uri_sha }}" "$EXTRA_URI"
+            docker push "$EXTRA_URI"
+          fi
+
+          echo "image_uri=${{ steps.meta.outputs.image_uri_sha }}" >> $GITHUB_OUTPUT
+
+  # ── Job 2: Terraform apply with updated container image ─────────────────────
+  deploy:
+    name: Terraform Apply · ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    needs: build
+    environment: ${{ inputs.environment }}   # triggers GitHub Environment protection rules (e.g. prod approval)
+
+    outputs:
+      task_definition_arn: ${{ steps.get-taskdef-arn.outputs.task_definition_arn }}
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.stack_directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: deploy-msvc-tf-${{ inputs.environment }}-${{ github.run_id }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="${{ github.workspace }}/${{ inputs.backend_config_file }}"
+
+      - name: Terraform validate
+        run: terraform validate -no-color
+
+      - name: Build Terraform var flags
+        id: tf-vars
+        run: |
+          # Always inject the new container image
+          VAR_ARGS="-var=container_image=${{ needs.build.outputs.image_uri }}"
+
+          # Append var_file if provided
+          if [ -n "${{ inputs.var_file }}" ]; then
+            VAR_ARGS="$VAR_ARGS -var-file=${{ github.workspace }}/${{ inputs.var_file }}"
+          fi
+
+          # Append any extra key=value vars from the terraform_vars input
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            VAR_ARGS="$VAR_ARGS -var=$line"
+          done <<< "${{ inputs.terraform_vars }}"
+
+          echo "var_args=$VAR_ARGS" >> $GITHUB_OUTPUT
+
+      - name: Terraform plan
+        id: plan
+        run: |
+          terraform plan -input=false -no-color -out=tfplan \
+            ${{ steps.tf-vars.outputs.var_args }}
+
+      - name: Terraform apply
+        id: apply
+        run: |
+          terraform apply -input=false -no-color -auto-approve tfplan \
+            2>&1 | tee apply_output.txt
+
+      - name: Get deployed task definition ARN
+        id: get-taskdef-arn
+        if: steps.apply.outcome == 'success'
+        run: |
+          ARN=$(terraform output -raw task_definition_arn 2>/dev/null || echo "")
+          echo "task_definition_arn=$ARN" >> $GITHUB_OUTPUT
+
+      - name: Wait for ECS service stability
+        if: inputs.deployment_wait_minutes > 0 && steps.apply.outcome == 'success'
+        run: |
+          # Derive the service name from Terraform outputs; fall back gracefully.
+          SERVICE=$(terraform output -raw service_name 2>/dev/null || echo "")
+          CLUSTER=$(terraform output -raw cluster_name 2>/dev/null || echo "")
+
+          if [ -n "$SERVICE" ] && [ -n "$CLUSTER" ]; then
+            echo "Waiting up to ${{ inputs.deployment_wait_minutes }} minutes for $SERVICE to stabilize..."
+            TIMEOUT=$(( ${{ inputs.deployment_wait_minutes }} * 60 ))
+            aws ecs wait services-stable \
+              --cluster "$CLUSTER" \
+              --services "$SERVICE" \
+              --cli-read-timeout "$TIMEOUT" \
+              --cli-connect-timeout 60
+            echo "Service is stable."
+          else
+            echo "Could not determine service/cluster name from Terraform outputs — skipping stability wait."
+          fi
+
+      - name: Deployment summary
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const applyOutput = fs.existsSync('${{ inputs.stack_directory }}/apply_output.txt')
+              ? fs.readFileSync('${{ inputs.stack_directory }}/apply_output.txt', 'utf8')
+              : '(no output captured)';
+            const truncated = applyOutput.length > 20000
+              ? applyOutput.substring(0, 20000) + '\n\n... (truncated)'
+              : applyOutput;
+
+            const status = '${{ steps.apply.outcome }}' === 'success' ? '✅' : '❌';
+            await core.summary
+              .addHeading(`${status} Microservice Deployed · \`${{ inputs.environment }}\``)
+              .addTable([
+                [{data: 'Field', header: true}, {data: 'Value', header: true}],
+                ['Stack',       '`${{ inputs.stack_directory }}`'],
+                ['ECR Repo',    '`${{ inputs.ecr_repository }}`'],
+                ['Image SHA',   '`${{ needs.build.outputs.short_sha }}`'],
+                ['Image URI',   '`${{ needs.build.outputs.image_uri }}`'],
+                ['Runtime',     '`${{ inputs.runtime }}`'],
+                ['Actor',       `@${{ github.actor }}`],
+              ])
+              .addHeading('Terraform Output', 3)
+              .addCodeBlock(truncated, 'hcl')
+              .write();
+
+      - name: Fail build on apply error
+        if: steps.apply.outcome == 'failure'
+        run: exit 1
