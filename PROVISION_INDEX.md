@@ -112,7 +112,7 @@ module "api" {
 | Stack | Pattern | Key Services |
 |---|---|---|
 | `base-network` | VPC + subnets + endpoints | `network` |
-| `platform` | Shared cluster, databases, queues, secrets | `ecs`, `rds`, `elasticache`, `sqs`, `sns`, `kms`, SSM outputs |
+| `platform` | Shared networking, compute, load balancers, security groups, IAM, TLS | `ecs`, `alb`, `iam`, `kms`, `acm`, `route53`, `monitoring`, SSM outputs |
 | `ecs-cluster` | ECS cluster + ALB + security groups | `ecs`, `alb` |
 | `bff` | Backend-for-Frontend HTTP service on ECS | `ecs`, `alb`, `route53`, `acm` |
 | `microservice` | Internal ECS service behind private ALB | `ecs`, `alb` |
@@ -183,21 +183,25 @@ data "aws_ssm_parameter" "private_subnet_ids" {
 
 ### Key SSM paths published by `stacks/platform`
 
-| SSM Path | Value |
-|---|---|
-| `{prefix}/vpc_id` | VPC ID |
-| `{prefix}/private_subnet_ids` | Comma-separated private subnet IDs |
-| `{prefix}/db_subnet_ids` | Comma-separated DB subnet IDs |
-| `{prefix}/public_subnet_ids` | Comma-separated public subnet IDs |
-| `{prefix}/ecs_cluster_arn` | ECS cluster ARN |
-| `{prefix}/rds_endpoint` | Aurora writer endpoint |
-| `{prefix}/rds_reader_endpoint` | Aurora reader endpoint |
-| `{prefix}/rds_secret_arn` | RDS managed password secret ARN |
-| `{prefix}/redis_primary_endpoint` | Redis primary endpoint |
-| `{prefix}/redis_port` | Redis port |
-| `{prefix}/sqs_orders_url` | Orders queue URL |
-| `{prefix}/sqs_orders_arn` | Orders queue ARN |
-| `{prefix}/kms_key_arn` | Shared KMS key ARN |
+| SSM Path | Value | Published by |
+|---|---|---|
+| `{prefix}/vpc_id` | VPC ID | `stacks/platform` |
+| `{prefix}/public_subnet_ids` | Comma-separated public subnet IDs | `stacks/platform` |
+| `{prefix}/private_subnet_ids` | Comma-separated private subnet IDs | `stacks/platform` |
+| `{prefix}/db_subnet_ids` | Comma-separated DB subnet IDs | `stacks/platform` |
+| `{prefix}/ecs_cluster_arn` | ECS cluster ARN | `stacks/platform` |
+| `{prefix}/public_alb_listener_arn` | Public ALB HTTPS listener ARN | `stacks/platform` |
+| `{prefix}/private_alb_listener_arn` | Private ALB HTTPS listener ARN | `stacks/platform` |
+| `{prefix}/sg_ecs_tasks_id` | ECS tasks security group ID | `stacks/platform` |
+| `{prefix}/sg_rds_id` | RDS security group ID | `stacks/platform` |
+| `{prefix}/sg_elasticache_id` | ElastiCache security group ID | `stacks/platform` |
+| `{prefix}/sg_lambda_id` | Lambda security group ID | `stacks/platform` |
+| `{prefix}/kms_key_arn` | Shared KMS key ARN | `stacks/platform` |
+| `{prefix}/rds_endpoint` | Aurora writer endpoint | `stacks/data-layer` |
+| `{prefix}/rds_reader_endpoint` | Aurora reader endpoint | `stacks/data-layer` |
+| `{prefix}/rds_secret_arn` | RDS managed password secret ARN | `stacks/data-layer` |
+| `{prefix}/redis_primary_endpoint` | Redis primary endpoint | `stacks/data-layer` |
+| `{prefix}/redis_port` | Redis port | `stacks/data-layer` |
 
 ---
 
@@ -376,9 +380,9 @@ Apply in this order on a new environment:
 
 1. `bootstrap/state-backend` — S3 bucket + DynamoDB for Terraform state
 2. `bootstrap/oidc` — OIDC provider + Terraform execution role
-3. `environments/<env>` (base-network stack) — VPC and subnets
-4. `environments/<env>` (platform stack) — ECS cluster, databases, queues, KMS → publishes SSM parameters
-5. App stacks — consume SSM parameters from platform
+3. `stacks/platform` — VPC, ECS cluster, ALBs, security groups, IAM, KMS, TLS → publishes SSM parameters
+4. `stacks/data-layer` — Aurora, ElastiCache, DynamoDB (reads VPC/subnet SSM params from platform)
+5. App stacks (`bff`, `microservice`, `serverless`, etc.) — consume SSM parameters from platform and data-layer
 
 ---
 
