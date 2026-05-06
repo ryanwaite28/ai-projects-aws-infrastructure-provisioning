@@ -1,6 +1,6 @@
 # CLAUDE.md — Project Instructions
 
-This is a Terraform module library and GitHub Actions workflow template for provisioning highly available, multi-region AWS infrastructure. See `PROJECT.md` for full design intent, module reference, and bootstrap runbook.
+This is a Terraform module library and GitHub Actions workflow template for provisioning highly available, multi-region AWS infrastructure. See `PROJECT.md` for full design intent, module reference, and bootstrap runbook. See `BEST_PRACTICES.md` for opinionated engineering standards (naming, IAM, state, cross-stack wiring, secrets).
 
 ---
 
@@ -54,7 +54,7 @@ modules/<name>/
 ### State
 - Remote state: S3 + DynamoDB per environment account
 - State path: `{environment}/{stack}/terraform.tfstate`
-- Cross-stack references: use `terraform_remote_state` or SSM Parameter Store
+- Cross-stack references: prefer SSM Parameter Store; use `terraform_remote_state` only when stacks are tightly coupled within the same team/account
 
 ---
 

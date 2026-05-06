@@ -155,7 +155,17 @@ Region short codes:
 
 ---
 
-## Cross-Stack Wiring via SSM
+## Cross-Stack Wiring
+
+Modules and stacks must not directly depend on each other's internal state. Three controlled patterns exist — this project uses **SSM Parameter Store** as the default for cross-stack references.
+
+| Pattern | When to use | Trade-offs |
+|---|---|---|
+| Direct output passing | Two modules in the same stack (same Terraform state) | Simple, native — not usable across separate states |
+| `terraform_remote_state` | Cross-state, same-team, tightly coupled stacks | Works across stacks — couples consuming stack to state file structure; requires backend access permissions |
+| SSM Parameter Store | Cross-stack, decoupled, or multi-account (default here) | Fully decoupled — no state access needed; IAM-controlled per parameter |
+
+### SSM Parameter Store (preferred)
 
 The `platform` stack publishes all shared infrastructure outputs to SSM Parameter Store under a prefix. App stacks read these parameters instead of hard-coding values or using Terraform remote state.
 
